@@ -6,3 +6,5 @@ duckdb_unittest_tempdir
 /test/bin
 venv
 vcpkg_installed
+tmp/*.dta
+tmp/*bin
