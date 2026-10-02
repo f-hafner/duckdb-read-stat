@@ -1,5 +1,6 @@
 #include "readstat.h"
 #include <stdio.h>
+#include <string.h>
 
 int handle_metadata(readstat_metadata_t *metadata, void *ctx) {
     int *my_var_count = (int *)ctx;
@@ -13,8 +14,13 @@ int handle_variable(int index, readstat_variable_t *variable,
     const char *val_labels, void *ctx) {
     int *my_var_count = (int *)ctx;
 
+    const char *var_name = readstat_variable_get_name(variable); 
+
     printf("%s", readstat_variable_get_name(variable));
-    if (index == *my_var_count - 1) {
+    // this works, but the 'wage' string is still in the table header (column names)
+    if (strcmp(var_name, "wage") == 0) {
+        return READSTAT_HANDLER_SKIP_VARIABLE;
+    } else if (index == *my_var_count - 1) {
         printf("\n");
     } else {
         printf("\t");
@@ -62,6 +68,7 @@ int main(int argc, char *argv[]) {
     readstat_set_metadata_handler(parser, &handle_metadata);
     readstat_set_variable_handler(parser, &handle_variable);
     readstat_set_value_handler(parser, &handle_value);
+    readstat_set_row_limit(parser, 10);
 
     error = readstat_parse_dta(parser, argv[1], &my_var_count);
 
