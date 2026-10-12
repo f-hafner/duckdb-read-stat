@@ -2,11 +2,22 @@
 #include <stdio.h>
 #include <string.h>
 
+#define MAX_SKIP_VARS 5
 
 struct MyConfig {
     int var_count;
-    const char *skip_var;
+    const char *skip_vars[MAX_SKIP_VARS];
+    int skip_var_count;
 };
+
+static int should_skip(const char *name, const struct MyConfig *cfg) {
+    for (int i = 0; i < cfg->skip_var_count; i++) {
+        if (strcmp(name, cfg->skip_vars[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
 
 
 int handle_metadata(readstat_metadata_t *metadata, void *ctx) {
@@ -26,7 +37,7 @@ int handle_variable(int index, readstat_variable_t *variable,
 
     const char *var_name = readstat_variable_get_name(variable); 
 
-    if (strcmp(var_name, my_config->skip_var) == 0) {
+    if (should_skip(var_name, my_config)) {
         return READSTAT_HANDLER_SKIP_VARIABLE;
     }
     // Setting this here seems to imply that `handle_value` ignores the entire
@@ -79,7 +90,11 @@ int main(int argc, char *argv[]) {
     }
     //int my_var_count = 0;
 
-    struct MyConfig myconfig = {.var_count = 0, .skip_var = "sector"};
+    struct MyConfig myconfig = {
+        .var_count = 0, 
+        .skip_vars = {"sector", "wage"}, // null_col is the last one -> special handling? or is it b/c of the null?
+        .skip_var_count = 2
+    };
     readstat_error_t error = READSTAT_OK;
     readstat_parser_t *parser = readstat_parser_init();
     readstat_set_metadata_handler(parser, &handle_metadata);
