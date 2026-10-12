@@ -9,7 +9,7 @@ gcc -o test_bin  \
 	-L../build/release/ \
 	-lread_stat \
     -lm \
-	main.cc
+	main.c
 
 # Using the binary
 #LD_LIBRARY_PATH=../build/release ./test_bin
