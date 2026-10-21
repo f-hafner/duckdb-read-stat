@@ -43,6 +43,9 @@ typedef struct duckdb_read_stat_init_data
 {
     idx_t offset;
     idx_t actual_rows_read;
+    idx_t projected_column_count;
+    // FAM; can only have one varying-length array
+    idx_t projected_column_indexes[];
 } duckdb_read_stat_init_data;
 
 void duckdb_read_stat_init(duckdb_init_info info);

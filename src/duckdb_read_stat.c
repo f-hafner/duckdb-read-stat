@@ -1,3 +1,4 @@
+#include "readstat.h"
 #include <string.h>
 #if defined(_MSC_VER)
 
@@ -237,9 +238,21 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
 
 void duckdb_read_stat_init(duckdb_init_info info)
 {
-    duckdb_read_stat_init_data *data = duckdb_malloc(sizeof(duckdb_read_stat_init_data));
+    idx_t column_count = duckdb_init_get_column_count(info);
+    duckdb_read_stat_init_data *data =
+        duckdb_malloc(sizeof(*data) + sizeof(idx_t) * column_count);
+
     data->offset = 0;
     data->actual_rows_read = 0;
+    data->projected_column_count = column_count;
+    
+    for (idx_t i = 0; i < column_count; i++) {
+        data->projected_column_indexes[i] = duckdb_init_get_column_index(info, i);
+    }
+    // idea: extract here all the *indices* in the original column from duckdb -> we can use it
+    // to define the skip!
+    // TODO: for some reason, the select has a 0 here - is that b/c it's during bind?
+    // and we only know which indexes after optimization (during execute?)
     duckdb_init_set_init_data(info, data, duckdb_free);
 }
 
@@ -377,7 +390,16 @@ int duckdb_read_stat_handle_value(int obs_index, readstat_variable_t *variable, 
     idx_t var_index = readstat_variable_get_index(variable);
     readstat_type_t type = readstat_value_type(value);
     const char *format = readstat_variable_get_format(variable);
-    duckdb_vector vector = duckdb_data_chunk_get_vector(context->data_chunk, var_index);
+    // TODO: this is done for each row. use better data structure? where? in read_stat_init?
+    idx_t duckdb_chunk_vector_index;
+    for (idx_t i = 0; i < init_data->projected_column_count; i++) {
+        idx_t idx_in_original_table = init_data->projected_column_indexes[i];
+        if (idx_in_original_table == var_index) {
+           duckdb_chunk_vector_index = i;
+           break;
+        }
+    }
+    duckdb_vector vector = duckdb_data_chunk_get_vector(context->data_chunk, duckdb_chunk_vector_index);
 
     if (!readstat_value_is_system_missing(value) && !readstat_value_is_tagged_missing(value) && !readstat_value_is_defined_missing(value, variable))
     {
@@ -481,7 +503,22 @@ int duckdb_read_stat_handle_metadata(readstat_metadata_t *metadata, void *ctx)
 int duckdb_read_stat_handle_variable(int index, readstat_variable_t *variable,
                                      const char *val_labels, void *ctx)
 {
-    return READSTAT_HANDLER_OK;
+    duckdb_read_stat_context *context = (duckdb_read_stat_context *)ctx;
+    duckdb_read_stat_bind_data *bind_data = duckdb_function_get_bind_data(context->function_info);
+    duckdb_read_stat_init_data *init_data = duckdb_function_get_init_data(context->function_info);
+    idx_t var_idx = readstat_variable_get_index(variable); // TODO: use `index`?
+    const char *var_name = readstat_variable_get_name(variable);
+    // NOTE: inefficient (quadratic complexity); only for testing. will need better data structure later
+    // The challenge is that we don't know the order of the columns in advance!
+    // NOTE: the index is alreayd available and we can make this a bit simpler
+    for (idx_t i = 0; i < init_data->projected_column_count; i++) {
+       if (init_data->projected_column_indexes[i] == var_idx) {
+           printf("selecting variable %s\n", var_name);
+           return READSTAT_HANDLER_OK;
+        }
+    }
+    printf("skipping variable %s\n", var_name);
+    return READSTAT_HANDLER_SKIP_VARIABLE;
 }
 
 int duckdb_read_stat_handle_value_label(const char *val_labels, readstat_value_t value, const char *label, void *ctx)
@@ -647,6 +684,7 @@ void duckdb_read_stat_register_read_stat_function(duckdb_connection connection)
     duckdb_table_function_set_bind(function, &duckdb_read_stat_bind);
     duckdb_table_function_set_init(function, &duckdb_read_stat_init);
     duckdb_table_function_set_function(function, &duckdb_read_stat_function);
+    duckdb_table_function_supports_projection_pushdown(function, true);
 
     duckdb_state result = duckdb_register_table_function(connection, function);
 
