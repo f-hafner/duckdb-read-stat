@@ -1,3 +1,4 @@
+#include "readstat.h"
 #include <string.h>
 #if defined(_MSC_VER)
 
@@ -29,6 +30,7 @@ int duckdb_read_stat_bind_handle_metadata(readstat_metadata_t *metadata, void *c
 {
     duckdb_read_stat_bind_data *context = (duckdb_read_stat_bind_data *)ctx;
     context->cardinality = readstat_get_row_count(metadata);
+    context->var_count = readstat_get_var_count(metadata);
     return READSTAT_HANDLER_OK;
 }
 
@@ -237,9 +239,23 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
 
 void duckdb_read_stat_init(duckdb_init_info info)
 {
-    duckdb_read_stat_init_data *data = duckdb_malloc(sizeof(duckdb_read_stat_init_data));
+    duckdb_read_stat_bind_data *bind_data = duckdb_init_get_bind_data(info);
+    duckdb_read_stat_init_data *data =
+        duckdb_malloc(sizeof(*data) + sizeof(idx_t) * bind_data->var_count);
+
     data->offset = 0;
     data->actual_rows_read = 0;
+
+    // Set sentinel value
+    for (idx_t source_idx = 0; source_idx < bind_data->var_count; source_idx++) {
+        data->projection_map[source_idx] = COL_SKIPPED;
+    }
+
+    idx_t result_size = duckdb_init_get_column_count(info);
+    for (idx_t result_idx = 0; result_idx < result_size; result_idx++) {
+        idx_t source_idx = duckdb_init_get_column_index(info, result_idx);
+        data->projection_map[source_idx] = result_idx;
+    }
     duckdb_init_set_init_data(info, data, duckdb_free);
 }
 
@@ -377,7 +393,9 @@ int duckdb_read_stat_handle_value(int obs_index, readstat_variable_t *variable, 
     idx_t var_index = readstat_variable_get_index(variable);
     readstat_type_t type = readstat_value_type(value);
     const char *format = readstat_variable_get_format(variable);
-    duckdb_vector vector = duckdb_data_chunk_get_vector(context->data_chunk, var_index);
+
+    idx_t duckdb_chunk_vector_index = init_data->projection_map[var_index];
+    duckdb_vector vector = duckdb_data_chunk_get_vector(context->data_chunk, duckdb_chunk_vector_index);
 
     if (!readstat_value_is_system_missing(value) && !readstat_value_is_tagged_missing(value) && !readstat_value_is_defined_missing(value, variable))
     {
@@ -481,6 +499,14 @@ int duckdb_read_stat_handle_metadata(readstat_metadata_t *metadata, void *ctx)
 int duckdb_read_stat_handle_variable(int index, readstat_variable_t *variable,
                                      const char *val_labels, void *ctx)
 {
+    duckdb_read_stat_context *context = (duckdb_read_stat_context *)ctx;
+    duckdb_read_stat_init_data *init_data = duckdb_function_get_init_data(context->function_info);
+    idx_t var_idx = readstat_variable_get_index(variable);
+    const char *var_name = readstat_variable_get_name(variable);
+
+    if (init_data->projection_map[var_idx] == COL_SKIPPED) {
+        return READSTAT_HANDLER_SKIP_VARIABLE;
+    }
     return READSTAT_HANDLER_OK;
 }
 
@@ -647,6 +673,7 @@ void duckdb_read_stat_register_read_stat_function(duckdb_connection connection)
     duckdb_table_function_set_bind(function, &duckdb_read_stat_bind);
     duckdb_table_function_set_init(function, &duckdb_read_stat_init);
     duckdb_table_function_set_function(function, &duckdb_read_stat_function);
+    duckdb_table_function_supports_projection_pushdown(function, true);
 
     duckdb_state result = duckdb_register_table_function(connection, function);
 
