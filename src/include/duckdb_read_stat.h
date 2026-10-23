@@ -16,6 +16,8 @@ typedef enum duckdb_read_stat_datetime_format
     DATE_FORMAT_TIME
 } duckdb_read_stat_datetime_format;
 
+enum { COL_SKIPPED = -1 };
+
 typedef struct duckdb_read_stat_bind_data
 {
     duckdb_read_stat_file_format file_format;
@@ -26,6 +28,7 @@ typedef struct duckdb_read_stat_bind_data
     char *error_message;
     duckdb_bind_info bind_info;
     duckdb_file_handle file_handle;
+    int64_t var_count;
 } duckdb_read_stat_bind_data;
 
 int duckdb_read_stat_ends_with(const char *string, const char *suffix);
@@ -43,9 +46,9 @@ typedef struct duckdb_read_stat_init_data
 {
     idx_t offset;
     idx_t actual_rows_read;
-    idx_t projected_column_count;
     // FAM; can only have one varying-length array
-    idx_t projected_column_indexes[];
+    // array whose length will be the number of columns in the original table
+    idx_t projection_map[];
 } duckdb_read_stat_init_data;
 
 void duckdb_read_stat_init(duckdb_init_info info);

@@ -30,6 +30,7 @@ int duckdb_read_stat_bind_handle_metadata(readstat_metadata_t *metadata, void *c
 {
     duckdb_read_stat_bind_data *context = (duckdb_read_stat_bind_data *)ctx;
     context->cardinality = readstat_get_row_count(metadata);
+    context->var_count = readstat_get_var_count(metadata);
     return READSTAT_HANDLER_OK;
 }
 
@@ -238,21 +239,23 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
 
 void duckdb_read_stat_init(duckdb_init_info info)
 {
-    idx_t column_count = duckdb_init_get_column_count(info);
+    duckdb_read_stat_bind_data *bind_data = duckdb_init_get_bind_data(info);
     duckdb_read_stat_init_data *data =
-        duckdb_malloc(sizeof(*data) + sizeof(idx_t) * column_count);
+        duckdb_malloc(sizeof(*data) + sizeof(idx_t) * bind_data->var_count);
 
     data->offset = 0;
     data->actual_rows_read = 0;
-    data->projected_column_count = column_count;
-    
-    for (idx_t i = 0; i < column_count; i++) {
-        data->projected_column_indexes[i] = duckdb_init_get_column_index(info, i);
+
+    // Set sentinel value
+    for (idx_t source_idx = 0; source_idx < bind_data->var_count; source_idx++) {
+        data->projection_map[source_idx] = COL_SKIPPED;
     }
-    // idea: extract here all the *indices* in the original column from duckdb -> we can use it
-    // to define the skip!
-    // TODO: for some reason, the select has a 0 here - is that b/c it's during bind?
-    // and we only know which indexes after optimization (during execute?)
+
+    idx_t result_size = duckdb_init_get_column_count(info);
+    for (idx_t result_idx = 0; result_idx < result_size; result_idx++) {
+        idx_t source_idx = duckdb_init_get_column_index(info, result_idx);
+        data->projection_map[source_idx] = result_idx;
+    }
     duckdb_init_set_init_data(info, data, duckdb_free);
 }
 
@@ -390,15 +393,8 @@ int duckdb_read_stat_handle_value(int obs_index, readstat_variable_t *variable, 
     idx_t var_index = readstat_variable_get_index(variable);
     readstat_type_t type = readstat_value_type(value);
     const char *format = readstat_variable_get_format(variable);
-    // TODO: this is done for each row. use better data structure? where? in read_stat_init?
-    idx_t duckdb_chunk_vector_index;
-    for (idx_t i = 0; i < init_data->projected_column_count; i++) {
-        idx_t idx_in_original_table = init_data->projected_column_indexes[i];
-        if (idx_in_original_table == var_index) {
-           duckdb_chunk_vector_index = i;
-           break;
-        }
-    }
+
+    idx_t duckdb_chunk_vector_index = init_data->projection_map[var_index];
     duckdb_vector vector = duckdb_data_chunk_get_vector(context->data_chunk, duckdb_chunk_vector_index);
 
     if (!readstat_value_is_system_missing(value) && !readstat_value_is_tagged_missing(value) && !readstat_value_is_defined_missing(value, variable))
@@ -504,21 +500,14 @@ int duckdb_read_stat_handle_variable(int index, readstat_variable_t *variable,
                                      const char *val_labels, void *ctx)
 {
     duckdb_read_stat_context *context = (duckdb_read_stat_context *)ctx;
-    duckdb_read_stat_bind_data *bind_data = duckdb_function_get_bind_data(context->function_info);
     duckdb_read_stat_init_data *init_data = duckdb_function_get_init_data(context->function_info);
-    idx_t var_idx = readstat_variable_get_index(variable); // TODO: use `index`?
+    idx_t var_idx = readstat_variable_get_index(variable);
     const char *var_name = readstat_variable_get_name(variable);
-    // NOTE: inefficient (quadratic complexity); only for testing. will need better data structure later
-    // The challenge is that we don't know the order of the columns in advance!
-    // NOTE: the index is alreayd available and we can make this a bit simpler
-    for (idx_t i = 0; i < init_data->projected_column_count; i++) {
-       if (init_data->projected_column_indexes[i] == var_idx) {
-           printf("selecting variable %s\n", var_name);
-           return READSTAT_HANDLER_OK;
-        }
+
+    if (init_data->projection_map[var_idx] == COL_SKIPPED) {
+        return READSTAT_HANDLER_SKIP_VARIABLE;
     }
-    printf("skipping variable %s\n", var_name);
-    return READSTAT_HANDLER_SKIP_VARIABLE;
+    return READSTAT_HANDLER_OK;
 }
 
 int duckdb_read_stat_handle_value_label(const char *val_labels, readstat_value_t value, const char *label, void *ctx)
