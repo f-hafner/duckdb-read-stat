@@ -29,6 +29,7 @@ typedef struct duckdb_read_stat_bind_data
     duckdb_bind_info bind_info;
     duckdb_file_handle file_handle;
     int64_t var_count;
+    int64_t* projection_map;
 } duckdb_read_stat_bind_data;
 
 int duckdb_read_stat_ends_with(const char *string, const char *suffix);
@@ -46,9 +47,6 @@ typedef struct duckdb_read_stat_init_data
 {
     idx_t offset;
     idx_t actual_rows_read;
-    // FAM; can only have one varying-length array
-    // array whose length will be the number of columns in the original table
-    idx_t projection_map[];
 } duckdb_read_stat_init_data;
 
 void duckdb_read_stat_init(duckdb_init_info info);
