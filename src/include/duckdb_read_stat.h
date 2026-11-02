@@ -16,6 +16,8 @@ typedef enum duckdb_read_stat_datetime_format
     DATE_FORMAT_TIME
 } duckdb_read_stat_datetime_format;
 
+enum { COL_SKIPPED = -1 };
+
 typedef struct duckdb_read_stat_bind_data
 {
     duckdb_read_stat_file_format file_format;
@@ -26,6 +28,8 @@ typedef struct duckdb_read_stat_bind_data
     char *error_message;
     duckdb_bind_info bind_info;
     duckdb_file_handle file_handle;
+    int64_t var_count;
+    int64_t* projection_map;
 } duckdb_read_stat_bind_data;
 
 int duckdb_read_stat_ends_with(const char *string, const char *suffix);
