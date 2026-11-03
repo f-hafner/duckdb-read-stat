@@ -117,6 +117,26 @@ void duckdb_read_stat_bind_handle_error(const char *error_message, void *ctx)
     strcpy(context->error_message, error_message);
 }
 
+static void duckdb_read_stat_bind_data_free(void *ctx) { // makes no difference to memory lost
+    duckdb_read_stat_bind_data *data = (duckdb_read_stat_bind_data *)ctx;
+
+    if (!data) {
+        return;
+    }
+
+    duckdb_free(data->error_message);
+    duckdb_free((void *)data->path);
+    duckdb_free((void *)data->format);
+    duckdb_free((void *)data->encoding);
+
+    if (data->file_handle) {
+        duckdb_file_handle_close(data->file_handle);
+        duckdb_destroy_file_handle(&data->file_handle);
+    }
+    duckdb_free(data);
+}
+
+
 void duckdb_read_stat_bind(duckdb_bind_info info)
 {
     readstat_parser_t *parser = readstat_parser_init();
@@ -230,10 +250,12 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
 
     data->file_handle = io_context->file_handle;
     duckdb_bind_set_cardinality(data->bind_info, data->cardinality, true);
-    duckdb_bind_set_bind_data(info, data, duckdb_free);
+    duckdb_bind_set_bind_data(info, data, duckdb_read_stat_bind_data_free);
     duckdb_free(io_context);
     readstat_parser_free(parser);
 }
+
+
 
 void duckdb_read_stat_init(duckdb_init_info info)
 {
@@ -630,6 +652,7 @@ void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk outp
     init_data->offset += init_data->actual_rows_read;
     duckdb_data_chunk_set_size(output, init_data->actual_rows_read);
     init_data->actual_rows_read = 0;
+    duckdb_free(io_context); // total bytes lost: 486 -> 446. 8 bytes per call, ~5 chunks, checks out?
     duckdb_free(context);
 }
 
