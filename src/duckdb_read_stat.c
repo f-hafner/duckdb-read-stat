@@ -113,14 +113,29 @@ int duckdb_read_stat_bind_handle_variable(int index, readstat_variable_t *variab
 void duckdb_read_stat_bind_handle_error(const char *error_message, void *ctx)
 {
     duckdb_read_stat_bind_data *context = (duckdb_read_stat_bind_data *)ctx;
-    context->error_message = (char *)duckdb_malloc(strlen(error_message) + 1);
-    strcpy(context->error_message, error_message);
+
+    duckdb_free(context->error_message);
+    context->error_message = NULL;
+
+    if (error_message == NULL)
+    {
+        return;
+    }
+
+    size_t length = strlen(error_message) + 1;
+    context->error_message = (char *)duckdb_malloc(length);
+    if (context->error_message != NULL)
+    {
+        memcpy(context->error_message, error_message, length);
+    }
 }
 
-static void duckdb_read_stat_bind_data_free(void *ctx) { // makes no difference to memory lost
+static void duckdb_read_stat_bind_data_free(void *ctx)
+{
     duckdb_read_stat_bind_data *data = (duckdb_read_stat_bind_data *)ctx;
 
-    if (!data) {
+    if (!data)
+    {
         return;
     }
 
@@ -129,40 +144,88 @@ static void duckdb_read_stat_bind_data_free(void *ctx) { // makes no difference 
     duckdb_free((void *)data->format);
     duckdb_free((void *)data->encoding);
 
-    if (data->file_handle) {
-        duckdb_file_handle_close(data->file_handle);
+    /* duckdb_destroy_file_handle() also closes the file if it is still open. */
+    if (data->file_handle)
+    {
         duckdb_destroy_file_handle(&data->file_handle);
     }
+
     duckdb_free(data);
 }
 
 
 void duckdb_read_stat_bind(duckdb_bind_info info)
 {
-    readstat_parser_t *parser = readstat_parser_init();
-    duckdb_value path_value = duckdb_bind_get_parameter(info, 0);
-    duckdb_value format_value = duckdb_bind_get_named_parameter(info, "format");
-    duckdb_value encoding_value = duckdb_bind_get_named_parameter(info, "encoding");
-    const char *path = duckdb_get_varchar(path_value);
-    duckdb_read_stat_bind_data *data = duckdb_malloc(sizeof(duckdb_read_stat_bind_data));
-    readstat_error_t error;
-
-    data->bind_info = info;
-    data->path = path;
-    data->format = NULL;
-    data->encoding = NULL;
-
-    duckdb_read_stat_io_context *io_context = duckdb_malloc(sizeof(duckdb_read_stat_io_context));
+    /* Every resource is declared and nulled up front so the single cleanup
+     * block below can release whatever has been acquired so far. */
+    readstat_error_t error = READSTAT_OK;
+    readstat_parser_t *parser = NULL;
+    duckdb_value path_value = NULL;
+    duckdb_value format_value = NULL;
+    duckdb_value encoding_value = NULL;
     duckdb_client_context client_context = NULL;
+    duckdb_file_system file_system = NULL;
+    duckdb_file_open_options file_open_options = NULL;
+    duckdb_file_handle file_handle = NULL; /* not owned by `data` yet */
+    duckdb_read_stat_io_context *io_context = NULL;
+    duckdb_read_stat_bind_data *data = NULL;
+
+    parser = readstat_parser_init();
+    if (parser == NULL)
+    {
+        duckdb_bind_set_error(info, "read_stat: failed to create parser");
+        goto cleanup;
+    }
+
+    /* The duckdb_value wrappers are owned by us; the strings they produce are
+     * separate copies owned by the bind data. */
+    path_value = duckdb_bind_get_parameter(info, 0);
+    format_value = duckdb_bind_get_named_parameter(info, "format");
+    encoding_value = duckdb_bind_get_named_parameter(info, "encoding");
+
+    data = duckdb_malloc(sizeof(*data));
+    if (data == NULL)
+    {
+        duckdb_bind_set_error(info, "read_stat: out of memory");
+        goto cleanup;
+    }
+    /* Zero everything so every pointer is safe to free and file_handle stays
+     * NULL until we actually own a handle. */
+    memset(data, 0, sizeof(*data));
+    data->bind_info = info;
+
+    data->path = duckdb_get_varchar(path_value);
+    if (data->path == NULL)
+    {
+        duckdb_bind_set_error(info, "read_stat: could not read path");
+        goto cleanup;
+    }
+
     duckdb_table_function_get_client_context(info, &client_context);
-    duckdb_file_system file_system = duckdb_client_context_get_file_system(client_context);
-    duckdb_file_open_options file_open_options = duckdb_create_file_open_options();
+    file_system = duckdb_client_context_get_file_system(client_context);
+    file_open_options = duckdb_create_file_open_options();
     duckdb_file_open_options_set_flag(file_open_options, DUCKDB_FILE_FLAG_READ, true);
-    duckdb_file_handle file_handle = NULL;
-    duckdb_state open_state = duckdb_file_system_open(file_system, path, file_open_options, &file_handle);
-    io_context->file_handle = file_handle;
-    duckdb_destroy_file_open_options(&file_open_options);
-    duckdb_destroy_file_system(&file_system);
+
+    io_context = duckdb_malloc(sizeof(*io_context));
+    if (io_context == NULL)
+    {
+        duckdb_bind_set_error(info, "read_stat: out of memory");
+        goto cleanup;
+    }
+
+    if (duckdb_file_system_open(file_system, data->path, file_open_options, &file_handle) != DuckDBSuccess ||
+        file_handle == NULL)
+    {
+        file_handle = NULL;
+        duckdb_bind_set_error(info, "read_stat: could not open file");
+        goto cleanup;
+    }
+
+    /* From here on the bind data is the single owner of the handle;
+     * io_context only borrows it. */
+    data->file_handle = file_handle;
+    file_handle = NULL;
+    io_context->file_handle = data->file_handle;
 
     readstat_set_metadata_handler(parser, &duckdb_read_stat_bind_handle_metadata);
     readstat_set_variable_handler(parser, &duckdb_read_stat_bind_handle_variable);
@@ -176,82 +239,140 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
 
     if (encoding_value != NULL)
     {
-        const char *encoding = duckdb_get_varchar(encoding_value);
-        data->encoding = encoding;
-        readstat_set_file_character_encoding(parser, encoding);
+        data->encoding = duckdb_get_varchar(encoding_value);
+        if (data->encoding == NULL)
+        {
+            duckdb_bind_set_error(info, "read_stat: could not read encoding");
+            goto cleanup;
+        }
+        readstat_set_file_character_encoding(parser, data->encoding);
     }
 
     if (format_value != NULL)
     {
-        const char *format = duckdb_get_varchar(format_value);
-        data->format = format;
+        data->format = duckdb_get_varchar(format_value);
+        if (data->format == NULL)
+        {
+            duckdb_bind_set_error(info, "read_stat: could not read format");
+            goto cleanup;
+        }
+    }
 
-        if (!strcmp(format, "sas7bdat"))
+    /* `error` starts at READSTAT_OK, so an unknown format is reported instead
+     * of reading an uninitialized variable. */
+    if (data->format != NULL)
+    {
+        if (!strcmp(data->format, "sas7bdat"))
         {
             data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-            error = readstat_parse_sas7bdat(parser, path, data);
+            error = readstat_parse_sas7bdat(parser, data->path, data);
         }
-        if (!strcmp(format, "xpt"))
+        else if (!strcmp(data->format, "xpt"))
         {
             data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-            error = readstat_parse_xport(parser, path, data);
+            error = readstat_parse_xport(parser, data->path, data);
         }
-        else if (!strcmp(format, "sav") || !strcmp(format, "zsav"))
+        else if (!strcmp(data->format, "sav") || !strcmp(data->format, "zsav"))
         {
             data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-            error = readstat_parse_sav(parser, path, data);
+            error = readstat_parse_sav(parser, data->path, data);
         }
-        else if (!strcmp(format, "por"))
+        else if (!strcmp(data->format, "por"))
         {
             data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-            error = readstat_parse_por(parser, path, data);
+            error = readstat_parse_por(parser, data->path, data);
         }
-        else if (!strcmp(format, "dta"))
+        else if (!strcmp(data->format, "dta"))
         {
             data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
-            error = readstat_parse_dta(parser, path, data);
+            error = readstat_parse_dta(parser, data->path, data);
+        }
+        else
+        {
+            error = READSTAT_ERROR_PARSE; /* unknown format */
         }
     }
-    else if (duckdb_read_stat_ends_with(path, ".sas7bdat"))
+    else if (duckdb_read_stat_ends_with(data->path, ".sas7bdat"))
     {
         data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-        error = readstat_parse_sas7bdat(parser, path, data);
+        error = readstat_parse_sas7bdat(parser, data->path, data);
     }
-    else if (duckdb_read_stat_ends_with(path, ".xpt"))
+    else if (duckdb_read_stat_ends_with(data->path, ".xpt"))
     {
         data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-        error = readstat_parse_xport(parser, path, data);
+        error = readstat_parse_xport(parser, data->path, data);
     }
-    else if (duckdb_read_stat_ends_with(path, ".sav") || duckdb_read_stat_ends_with(path, ".zsav"))
+    else if (duckdb_read_stat_ends_with(data->path, ".sav") || duckdb_read_stat_ends_with(data->path, ".zsav"))
     {
         data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-        error = readstat_parse_sav(parser, path, data);
+        error = readstat_parse_sav(parser, data->path, data);
     }
-    else if (duckdb_read_stat_ends_with(path, ".por"))
+    else if (duckdb_read_stat_ends_with(data->path, ".por"))
     {
         data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-        error = readstat_parse_por(parser, path, data);
+        error = readstat_parse_por(parser, data->path, data);
     }
-    else if (duckdb_read_stat_ends_with(path, ".dta"))
+    else if (duckdb_read_stat_ends_with(data->path, ".dta"))
     {
         data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
-        error = readstat_parse_dta(parser, path, data);
+        error = readstat_parse_dta(parser, data->path, data);
+    }
+    else
+    {
+        error = READSTAT_ERROR_PARSE; /* unknown file extension */
     }
 
     if (error != READSTAT_OK)
     {
-        duckdb_bind_set_error(info, data->error_message);
-        duckdb_file_handle_close(io_context->file_handle);
-        duckdb_destroy_file_handle(&(io_context->file_handle));
-        duckdb_free(io_context);
-        readstat_parser_free(parser);
-        return;
+        duckdb_bind_set_error(
+            info,
+            data->error_message != NULL ? data->error_message : "read_stat: failed to read statistics file");
+        goto cleanup;
     }
 
-    data->file_handle = io_context->file_handle;
-    duckdb_bind_set_cardinality(data->bind_info, data->cardinality, true);
+    duckdb_bind_set_cardinality(info, data->cardinality, true);
+
+    /* DuckDB owns the bind data from here on and calls the recursive destructor
+     * once the bind data is no longer needed. */
     duckdb_bind_set_bind_data(info, data, duckdb_read_stat_bind_data_free);
+    data = NULL;
+
+cleanup:
+    /* Frees data plus path/format/encoding/error_message/file handle.
+     * NULL-safe, so this also releases partially built data on error. */
+    duckdb_read_stat_bind_data_free(data);
+
+    /* Handle opened but never handed over to `data` (defensive). */
+    if (file_handle != NULL)
+    {
+        duckdb_destroy_file_handle(&file_handle);
+    }
+
     duckdb_free(io_context);
+    if (file_open_options != NULL)
+    {
+        duckdb_destroy_file_open_options(&file_open_options);
+    }
+    if (file_system != NULL)
+    {
+        duckdb_destroy_file_system(&file_system);
+    }
+    if (client_context != NULL)
+    {
+        duckdb_destroy_client_context(&client_context);
+    }
+    if (path_value != NULL)
+    {
+        duckdb_destroy_value(&path_value);
+    }
+    if (format_value != NULL)
+    {
+        duckdb_destroy_value(&format_value);
+    }
+    if (encoding_value != NULL)
+    {
+        duckdb_destroy_value(&encoding_value);
+    }
     readstat_parser_free(parser);
 }
 
@@ -641,6 +762,9 @@ void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk outp
         }
         duckdb_file_handle_close(io_context->file_handle);
         duckdb_destroy_file_handle(&(io_context->file_handle));
+        /* The bind data owned this handle and its destructor will run later;
+         * clear the stale pointer so it is not destroyed a second time. */
+        bind_data->file_handle = NULL;
         duckdb_free(io_context);
         duckdb_free(context);
         readstat_parser_free(parser);
