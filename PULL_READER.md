@@ -47,6 +47,11 @@ readstat_error_t readstat_reader_read_rows(
     readstat_reader_t *reader,
     size_t max_rows);
 
+readstat_error_t readstat_reader_set_range(
+    readstat_reader_t *reader,
+    int64_t start_row,
+    int64_t row_count);
+
 int readstat_reader_is_eof(const readstat_reader_t *reader);
 void readstat_reader_close(readstat_reader_t *reader);
 ```
@@ -62,6 +67,11 @@ void readstat_reader_close(readstat_reader_t *reader);
 `readstat_reader_read_rows()` emits at most `max_rows` rows through the value
 handler. It returns with the parser positioned exactly where it stopped, so the
 next call continues the same scan.
+
+`readstat_reader_set_range()` repositions an open reader at `start_row` for at
+most `row_count` rows. It clears the reader's EOF state. DTA and uncompressed
+SAV implement it; other formats return
+`READSTAT_ERROR_UNSUPPORTED_OPERATION`.
 
 `readstat_reader_close()` performs format-specific finalization, closes the file
 through the IO callbacks, and frees the format context and reader.
@@ -221,7 +231,11 @@ The tests cover:
 
 - full scans across multiple chunks,
 - row counts and aggregates,
-- reading across the 2048-row chunk boundary with `OFFSET`.
+- reading across the 2048-row chunk boundary with `OFFSET`,
+- parallel scans for every fixture format with `PRAGMA threads=4`,
+- indexed formats built through `readstat_index_build()`,
+- parallel task boundaries and the short final task,
+- serial, index-free scans with `PRAGMA threads=1`.
 
 Verified:
 
@@ -238,10 +252,12 @@ roughly one second.
 
 ## Current limitations
 
-- Single-threaded: one reader cursor per query.
-- Metadata is parsed in both bind and init; it is never parsed per chunk.
-- Arbitrary row starts still scan to the requested offset. A page/row index is
-  future work.
+- An index is built during bind only when DuckDB's `threads` setting is greater
+  than 1. With `threads=1`, scans are serial and index-free.
+- Metadata is parsed in bind and again once per local reader; it is never parsed
+  per chunk or per task.
+- Indexed formats pay a one-time index-build pass per query. For row-compressed
+  SAV and ZSAV that pass includes decompression.
 - No projection pushdown yet.
 - RDC-compressed SAS is not covered by a fixture, though its existing decode
   path was preserved.
@@ -250,11 +266,52 @@ roughly one second.
 
 ---
 
-## Adding multithreaded reads
+## Multithreaded reads
 
-The current design deliberately keeps one reader per query. To add parallel
-reads, the reader must be able to start at a known row/page without scanning
-from row zero, and each thread must have its own parser and file handle.
+### Implemented
+
+The extension now scans all supported formats in parallel when DuckDB is
+configured with more than one thread:
+
+- DTA and uncompressed SAV compute row offsets arithmetically.
+- Row-compressed SAV, ZSAV, XPORT, POR, and SAS7BDAT use an immutable index
+  built once during bind.
+
+The ReadStat patch adds `readstat_reader_set_range()` so an open reader can be
+repositioned at a row range. Each format implements it with either an
+arithmetic seek or its index. `readstat_index_build()` constructs an index once
+and `readstat_reader_set_index()` attaches it to each local reader.
+
+The implementation works as follows:
+
+- Bind keeps the DuckDB file system instead of a shared file handle. The
+  metadata handle used during bind is closed before bind returns. If `threads`
+  is greater than 1 and the format needs an index, bind builds the index and
+  shares it read-only with every local reader.
+- Global init resets a shared atomic task cursor and calls
+  `duckdb_init_set_max_threads()` with the planned concurrency.
+- Each local init owns an init-data object. The table function opens one
+  DuckDB file handle, parser, format context, and pull reader per local
+  reader. For each claimed contiguous row range it calls
+  `readstat_reader_set_range()` and pulls chunks until the range is
+  exhausted. The same reader is then repositioned for the next range; it is
+  not reopened.
+- Task size is
+  `clamp(cardinality / (DUCKDB_READ_STAT_MAX_THREADS * 4), vector_size,
+  vector_size * 8)`, where `vector_size` is `duckdb_vector_size()` (normally
+  2048). Tasks are therefore one to eight DuckDB chunks. Files below two
+  vectors, files with unknown cardinality, and formats without an indexed row
+  start use one range and one reader.
+- With one thread, no index is built and the serial reader is used.
+- Parallel table scans do not preserve file order. Use `ORDER BY` when row
+  order matters.
+
+The rest of this document describes the general design and the remaining
+per-format work.
+
+To add parallel reads for another format, the reader must be able to start at a
+known row/page without scanning from row zero, and each thread must have its own
+parser and file handle.
 
 ### 1. Build a row/page index once
 
@@ -288,49 +345,31 @@ file_offset = data_offset + start_row * record_len
 or stored as a sparse array of row/byte checkpoints. No scan of the data section
 is needed.
 
-#### ZSAV: use the zlib trailer as the index
+#### ZSAV: the zlib trailer is not a row index
 
-ZSAV already contains a trailer table. Each `ztrailer_entry` maps a compressed
-byte range to an uncompressed byte range:
+The ZSAV trailer maps compressed byte ranges to zlib-uncompressed byte ranges.
+It does **not** map rows to bytes. ZSAV applies SPSS row compression first and
+then zlib-compresses the resulting 8-byte RLE command stream. After inflating a
+block, `uncompressed_ofs` points into that RLE command stream, not into
+fixed-width rows, so `start_row * row_len` is not a valid trailer lookup.
+
+A ZSAV index can still be checkpointed, but the checkpoint must capture the RLE
+decoder state at a row boundary:
 
 ```c
-struct ztrailer_entry {
-    int64_t uncompressed_ofs;
-    int64_t compressed_ofs;
-    int32_t uncompressed_size;
-    int32_t compressed_size;
+struct zsav_checkpoint {
+    int64_t first_row;
+    int block_index;
+    size_t block_data_offset; /* next inflated byte */
+    uint8_t chunk[8];         /* pending RLE command block */
+    uint8_t chunk_pos;        /* decoder's state.i */
 };
 ```
 
-The uncompressed data stream is just consecutive rows. With
-`row_len = var_offset * 8`, row `r` starts at uncompressed byte
-`r * row_len`.
-
-So the ZSAV index is the trailer itself, sorted by `uncompressed_ofs`:
-
-```c
-struct zsav_block_index_entry {
-    int64_t first_uncompressed_byte;
-    int64_t compressed_offset;
-    int32_t uncompressed_size;
-    int32_t compressed_size;
-};
-```
-
-To start at row `r` in a thread:
-
-1. Compute `start_byte = r * row_len`.
-2. Binary-search the trailer entry where
-   `uncompressed_ofs <= start_byte < uncompressed_ofs + uncompressed_size`.
-3. Seek to `compressed_ofs`, read `compressed_size` bytes, and uncompress the
-   block.
-4. Set the row decoder's `uncompressed_offset` to
-   `start_byte - uncompressed_ofs`.
-5. Load further blocks as the row/range crosses block boundaries.
-
-No data scan is needed to build this index. A row may cross a block boundary;
-the existing ZSAV reader already carries `uncompressed_offset` across blocks, so
-that case is handled naturally.
+Building this index requires one inflate + RLE expansion pass without typed
+value conversion. Like row-compressed SAV, that pass nearly doubles expansion
+work. ZSAV is therefore parallelized when `threads > 1`, but the index-build
+cost is part of the query. The trailer alone is not a row index.
 
 #### SAV row compression (RLE): checkpoint the decoder
 
@@ -415,13 +454,11 @@ added and only 2 of 50 columns are selected, decode/output work drops sharply
 while RLE expansion stays constant, so RLE expansion can easily become the
 major cost.
 
-Therefore row-compressed SAV should **not** be enabled for parallelism by
-default. It only makes sense when profiling shows that typed value decoding,
-string conversion, and DuckDB output dominate over RLE expansion. A
-producer/consumer pipeline (one decompressor feeding a small queue of decoded
-rows) avoids the double expansion but reintroduces buffering and thread
-coordination. A persistent per-file index cache is another option if the same
-file is read repeatedly.
+Row-compressed SAV is parallelized when `threads > 1`. Because index creation
+is itself a full expansion pass, the speedup depends on typed value decoding,
+string conversion, and DuckDB output dominating RLE expansion. A
+producer/consumer pipeline or persistent per-file index cache could reduce the
+double-expansion cost in the future.
 
 #### SAS7BDAT: index pages, then use the page cursor
 
@@ -467,9 +504,8 @@ SAS therefore does not need a byte-level index for compressed row payloads. It
 needs a page index plus the existing mid-page cursor, which the pull reader
 already implements.
 
-XPORT and POR have no fixed row table or trailer mapping. Supporting them in
-parallel means building a row-boundary byte index with a one-time scan; leave
-them single-threaded initially.
+XPORT and POR have no fixed row table or trailer mapping. Their parallel path
+builds a sparse row-boundary index with a one-time scan when `threads > 1`.
 
 #### Index build cost
 
@@ -479,40 +515,42 @@ by format:
 | Format | Index build cost | Notes |
 |---|---:|---|
 | DTA / uncompressed SAV | none | row offset is computed arithmetically |
-| ZSAV | O(trailer entries) | trailer is already read during open; cheaper than a data scan |
+| ZSAV | O(N) inflate + RLE expansion | trailer locates zlib blocks but not row starts; checkpoints need decoder state |
 | SAV RLE | O(N) sequential decode | full decompression pass without value conversion; checkpoint memory is O(N / interval) |
 | SAS7BDAT | O(page count) | page headers and subheader pointers only; no row decompression |
 | XPORT / POR | O(N) scan | requires a row-boundary byte index |
 
-Because this is a per-query overhead, the index should only be built when the
-parallel path is actually selected and the file is large enough to benefit. The
-serial path should stay index-free. For very small files, or queries with an
-effective `LIMIT`, building an RLE/SAS index can cost more than the serial scan
-it replaces.
+Because this is a per-query overhead, the current implementation only builds an
+index when DuckDB's `threads` setting is greater than 1. The serial path stays
+index-free. For very small files, or queries with an effective `LIMIT`, index
+creation can cost more than the serial scan it replaces.
 
 For prepared statements, the index can optionally be built once in `bind` and
 cached in bind data, but that makes bind more expensive and increases bind data
 memory. Building it in the global `init` is the simpler default.
 
-### 2. Add a start position to the reader API
+### 2. Reposition an open reader
 
-Extend the reader API with a start position:
+The reader API now includes:
 
 ```c
-readstat_reader_t *readstat_reader_open_at(
-    readstat_parser_t *parser,
-    readstat_file_format_t format,
-    const char *path,
+readstat_error_t readstat_reader_set_range(
+    readstat_reader_t *reader,
     int64_t start_row,
-    int64_t row_count,
-    void *user_ctx,
-    readstat_error_t *out_error);
+    int64_t row_count);
 ```
 
-`readstat_reader_open()` becomes the special case
-`readstat_reader_open_at(..., 0, -1, ...)`. Each format uses the index to seek
-directly to the page/block containing `start_row` and skips only within that
-page.
+It clears the reader's EOF state and repositions it at `start_row` for at most
+`row_count` rows (`row_count < 0` means to the end of the file). DTA and
+uncompressed SAV implement it directly:
+
+- DTA seeks to `data_rows_offset + start_row * record_len`.
+- Uncompressed SAV seeks to
+  `data_section_offset + start_row * (var_offset * 8)`.
+
+All other formats return `READSTAT_ERROR_UNSUPPORTED_OPERATION`. A dedicated
+`readstat_reader_open_at()` is not required for the current rollout because a
+reader can be opened at row zero and immediately repositioned.
 
 ### 3. Use DuckDB local init
 
@@ -530,39 +568,37 @@ In init:
 duckdb_init_set_max_threads(info, max_threads);
 ```
 
-In local init, each thread creates its own cursor:
+In local init, each thread creates its own empty cursor state:
 
 ```c
 void duckdb_read_stat_local_init(duckdb_init_info info) {
-    shared_state *shared = duckdb_init_get_bind_data(info);
-    stat_range range = claim_next_range(shared);
-    duckdb_read_stat_init_data *local = stat_cursor_open_range(shared, range);
+    duckdb_read_stat_init_data *local = duckdb_read_stat_init_data_create();
     duckdb_init_set_init_data(info, local, duckdb_read_stat_init_data_free);
 }
 ```
 
-In the table function:
+The table function opens the parser/reader lazily, then claims ranges and calls
+`readstat_reader_set_range()` for each one:
 
 ```c
 duckdb_read_stat_init_data *local =
     duckdb_function_get_local_init_data(info);
 ```
 
-The C API does not expose an explicit partition object, so a simple approach is
-a shared atomic work cursor in the bind/global state:
+The C API does not expose an explicit partition object, so the implementation
+uses a shared atomic work cursor in the bind/global state:
 
 ```c
 idx_t task = atomic_fetch_add(&shared->next_task, 1);
 ```
 
 Each task claims a contiguous row/page range. `duckdb_init_set_max_threads()`
-should only be set once cursors can start at arbitrary indexed positions.
+is set only when the format has a working indexed start.
 
 ### 4. Give each thread its own file handle
 
-The current bind data owns one file handle. That is not safe for concurrent
-readers. Store the `duckdb_file_system` in bind data and let each local init open
-its own file handle:
+Bind data keeps the `duckdb_file_system`, not a shared file handle. Each local
+reader opens and retains its own file handle:
 
 ```c
 duckdb_file_system_open(shared->file_system, shared->path, options, &handle);
@@ -583,18 +619,15 @@ Parallel table scans do not preserve row order. Queries that require file order
 must use `ORDER BY`, or the extension must restrict parallelism to 1 unless the
 query is order-insensitive.
 
-### Recommended rollout
+### Rollout status
 
-1. Keep serial readers as the default.
-2. Add `readstat_reader_open_at()` and record-offset starts for DTA and
-   uncompressed SAV.
-3. Add ZSAV starts using its existing zlib trailer entries; no data scan is
-   needed.
-4. Add row-compressed SAV starts using RLE checkpoints only if profiling shows
-   that typed decoding/output dominates RLE expansion. RLE has no seek table, so
-   index creation is itself a full expansion pass; default this format to
-   single-threaded.
-5. Add page-indexed SAS7BDAT starts, including mid-page/subheader cursors.
-6. Add XPORT/POR only if a row-boundary index is worth the extra scan.
-7. Enable `duckdb_init_set_max_threads()` per format only when that format has
-   a working random-access start.
+1. **Done:** arithmetic row starts for DTA and uncompressed SAV.
+2. **Done:** `readstat_reader_set_range()` and persistent per-thread readers.
+3. **Done:** per-query task cursor, local init, per-thread parser/file handle,
+   and `duckdb_init_set_max_threads()`.
+4. **Done:** index creation during bind when `threads > 1` for row-compressed
+   SAV, ZSAV, XPORT, POR, and SAS7BDAT.
+5. **Done:** RLE and ZSAV checkpoint indexes.
+6. **Done:** SAS7BDAT page index with per-page subheader cursors.
+7. **Done:** XPORT and POR row-boundary indexes.
+8. **Next:** consider projection pushdown and a persistent index cache.

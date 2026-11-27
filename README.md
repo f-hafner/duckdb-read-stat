@@ -49,6 +49,12 @@ Override the file character `encoding` inferred from the file with an `iconv` en
 FROM read_stat('latin1_encoded.sas7bdat', encoding = 'iso-8859-1');
 ```
 
+Scans can run in parallel when DuckDB is configured with more than one thread.
+DTA and uncompressed SAV use arithmetic row offsets; row-compressed SAV, ZSAV,
+XPORT, POR, and SAS7BDAT use an index built once during bind. With `threads=1`,
+no index is built and the serial reader is used. Parallel scans do not preserve
+file order; use `ORDER BY` when order matters.
+
 If your files have the proper file extensions and you do not need to override their character encodings, a [replacement scan](<https://duckdb.org/docs/stable/guides/glossary.html#replacement-scan>) is also available:
 
 ```SQL
