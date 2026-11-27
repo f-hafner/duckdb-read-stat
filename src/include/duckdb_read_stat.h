@@ -21,18 +21,30 @@ typedef struct duckdb_read_stat_bind_data
 {
     duckdb_read_stat_file_format file_format;
     readstat_file_format_t readstat_format;
+    readstat_compress_t compression;
     const char *format;
     const char *encoding;
     idx_t cardinality;
+    int64_t row_count;
     const char *path;
     char *error_message;
     duckdb_bind_info bind_info;
-    duckdb_file_handle file_handle;
+    duckdb_file_system file_system;
+    readstat_index_t *index;
 
     /* Per-column metadata that is invariant across chunks. */
     duckdb_read_stat_datetime_format *column_date_formats;
     uint8_t *column_has_defined_missing;
     idx_t column_count;
+
+    /* Parallel scan planning. The task cursor is shared by all local readers
+     * belonging to one execution of this table function. */
+    int parallel;
+    idx_t configured_threads;
+    idx_t task_size;
+    idx_t task_count;
+    idx_t max_threads;
+    volatile int64_t next_task;
 } duckdb_read_stat_bind_data;
 
 int duckdb_read_stat_ends_with(const char *string, const char *suffix);
@@ -71,9 +83,11 @@ typedef struct duckdb_read_stat_init_data
     readstat_reader_t *reader;
     duckdb_read_stat_io_context *io_context;
     duckdb_read_stat_context context;
+    int has_task;
 } duckdb_read_stat_init_data;
 
 void duckdb_read_stat_init(duckdb_init_info info);
+void duckdb_read_stat_local_init(duckdb_init_info info);
 
 int duckdb_read_stat_handle_metadata(readstat_metadata_t *metadata, void *ctx);
 int duckdb_read_stat_handle_variable(int index, readstat_variable_t *variable,

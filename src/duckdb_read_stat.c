@@ -13,6 +13,13 @@
 
 #include "duckdb_read_stat.h"
 
+#if defined(_MSC_VER)
+#include <windows.h>
+#endif
+
+#define DUCKDB_READ_STAT_MAX_THREADS 8
+#define DUCKDB_READ_STAT_MAX_TASK_VECTORS 8
+
 DUCKDB_EXTENSION_EXTERN
 
 int duckdb_read_stat_ends_with(const char *string, const char *suffix)
@@ -71,7 +78,9 @@ int duckdb_read_stat_bind_handle_metadata(readstat_metadata_t *metadata, void *c
     duckdb_read_stat_bind_data *context = (duckdb_read_stat_bind_data *)ctx;
     int var_count = readstat_get_var_count(metadata);
 
-    context->cardinality = readstat_get_row_count(metadata);
+    context->row_count = readstat_get_row_count(metadata);
+    context->cardinality = context->row_count > 0 ? (idx_t)context->row_count : 0;
+    context->compression = readstat_get_compression(metadata);
 
     if (var_count > 0)
     {
@@ -197,11 +206,10 @@ static void duckdb_read_stat_bind_data_free(void *ptr)
     if (data == NULL)
         return;
 
-    if (data->file_handle != NULL)
-    {
-        duckdb_file_handle_close(data->file_handle);
-        duckdb_destroy_file_handle(&data->file_handle);
-    }
+    if (data->index != NULL)
+        readstat_index_free(data->index);
+    if (data->file_system != NULL)
+        duckdb_destroy_file_system(&data->file_system);
 
     duckdb_free(data->column_date_formats);
     duckdb_free(data->column_has_defined_missing);
@@ -210,6 +218,99 @@ static void duckdb_read_stat_bind_data_free(void *ptr)
     duckdb_free((void *)data->format);
     duckdb_free((void *)data->encoding);
     duckdb_free(data);
+}
+
+static idx_t duckdb_read_stat_advance_task(duckdb_read_stat_bind_data *data)
+{
+#if defined(_MSC_VER)
+    return (idx_t)InterlockedExchangeAdd64((volatile LONG64 *)&data->next_task, 1);
+#else
+    return (idx_t)__atomic_fetch_add(&data->next_task, 1, __ATOMIC_SEQ_CST);
+#endif
+}
+
+static void duckdb_read_stat_reset_tasks(duckdb_read_stat_bind_data *data)
+{
+#if defined(_MSC_VER)
+    InterlockedExchange64((volatile LONG64 *)&data->next_task, 0);
+#else
+    __atomic_store_n(&data->next_task, 0, __ATOMIC_SEQ_CST);
+#endif
+}
+
+static int duckdb_read_stat_claim_task(duckdb_read_stat_bind_data *data, idx_t *start_row, idx_t *row_count)
+{
+    idx_t task = duckdb_read_stat_advance_task(data);
+
+    if (!data->parallel)
+    {
+        if (task > 0)
+            return false;
+        *start_row = 0;
+        *row_count = data->cardinality;
+        return true;
+    }
+
+    if (task >= data->task_count)
+        return false;
+
+    *start_row = task * data->task_size;
+    *row_count = data->cardinality - *start_row;
+    if (*row_count > data->task_size)
+        *row_count = data->task_size;
+
+    return *row_count > 0;
+}
+
+static int duckdb_read_stat_format_supports_indexed_start(const duckdb_read_stat_bind_data *data)
+{
+    if (data->readstat_format == READSTAT_FILE_FORMAT_DTA)
+        return true;
+
+    if (data->readstat_format == READSTAT_FILE_FORMAT_SAV && data->compression == READSTAT_COMPRESS_NONE)
+        return true;
+
+    return data->index != NULL;
+}
+
+static void duckdb_read_stat_plan_tasks(duckdb_read_stat_bind_data *data)
+{
+    idx_t task_size;
+    idx_t vector_size = duckdb_vector_size();
+    idx_t min_task_rows;
+    idx_t max_task_rows;
+
+    data->parallel = false;
+    data->task_size = data->cardinality;
+    data->task_count = 1;
+    data->max_threads = 1;
+    duckdb_read_stat_reset_tasks(data);
+
+    if (vector_size == 0)
+        vector_size = 2048;
+    min_task_rows = vector_size;
+    max_task_rows = vector_size * DUCKDB_READ_STAT_MAX_TASK_VECTORS;
+
+    if (data->configured_threads <= 1 || data->row_count <= 0 || data->cardinality < 2 * min_task_rows)
+        return;
+    if (!duckdb_read_stat_format_supports_indexed_start(data))
+        return;
+
+    task_size = data->cardinality / (DUCKDB_READ_STAT_MAX_THREADS * 4);
+    if (task_size < min_task_rows)
+        task_size = min_task_rows;
+    if (task_size > max_task_rows)
+        task_size = max_task_rows;
+
+    data->task_size = task_size;
+    data->task_count = (data->cardinality + task_size - 1) / task_size;
+    if (data->task_count <= 1)
+        return;
+
+    data->parallel = true;
+    data->max_threads = data->task_count < DUCKDB_READ_STAT_MAX_THREADS ? data->task_count : DUCKDB_READ_STAT_MAX_THREADS;
+    if (data->configured_threads < data->max_threads)
+        data->max_threads = data->configured_threads;
 }
 
 static bool duckdb_read_stat_set_format(duckdb_read_stat_bind_data *data)
@@ -284,6 +385,37 @@ static bool duckdb_read_stat_set_format(duckdb_read_stat_bind_data *data)
     return true;
 }
 
+static void duckdb_read_stat_init_data_clear_error(duckdb_read_stat_init_data *data)
+{
+    duckdb_free(data->context.error_message);
+    data->context.error_message = NULL;
+}
+
+static void duckdb_read_stat_init_data_close(duckdb_read_stat_init_data *data)
+{
+    if (data->reader != NULL)
+    {
+        readstat_reader_close(data->reader);
+        data->reader = NULL;
+    }
+    if (data->parser != NULL)
+    {
+        readstat_parser_free(data->parser);
+        data->parser = NULL;
+    }
+    if (data->io_context != NULL)
+    {
+        if (data->io_context->file_handle != NULL)
+        {
+            duckdb_file_handle_close(data->io_context->file_handle);
+            duckdb_destroy_file_handle(&data->io_context->file_handle);
+        }
+        duckdb_free(data->io_context);
+        data->io_context = NULL;
+    }
+    data->has_task = false;
+}
+
 static void duckdb_read_stat_init_data_free(void *ptr)
 {
     duckdb_read_stat_init_data *data = (duckdb_read_stat_init_data *)ptr;
@@ -291,16 +423,223 @@ static void duckdb_read_stat_init_data_free(void *ptr)
     if (data == NULL)
         return;
 
-    if (data->reader != NULL)
-        readstat_reader_close(data->reader);
-    if (data->parser != NULL)
-        readstat_parser_free(data->parser);
-
-    duckdb_free(data->io_context);
+    duckdb_read_stat_init_data_close(data);
     duckdb_free(data->context.vectors);
     duckdb_free(data->context.vector_data);
     duckdb_free(data->context.error_message);
     duckdb_free(data);
+}
+
+static duckdb_read_stat_init_data *duckdb_read_stat_init_data_create(void)
+{
+    duckdb_read_stat_init_data *data = duckdb_malloc(sizeof(duckdb_read_stat_init_data));
+
+    if (data == NULL)
+        return NULL;
+
+    memset(data, 0, sizeof(*data));
+    data->context.slot = 0;
+    data->context.row_count = 0;
+    data->context.last_obs_index = -1;
+
+    return data;
+}
+
+static void duckdb_read_stat_init_data_set_error(duckdb_read_stat_init_data *data, const char *message)
+{
+    if (data->context.error_message != NULL || message == NULL)
+        return;
+
+    data->context.error_message = (char *)duckdb_malloc(strlen(message) + 1);
+    if (data->context.error_message != NULL)
+        strcpy(data->context.error_message, message);
+}
+
+static int duckdb_read_stat_open_reader(duckdb_read_stat_init_data *data,
+                                        duckdb_read_stat_bind_data *bind_data)
+{
+    readstat_parser_t *parser;
+    duckdb_file_open_options file_open_options;
+    readstat_error_t error = READSTAT_OK;
+
+    duckdb_read_stat_init_data_close(data);
+    duckdb_read_stat_init_data_clear_error(data);
+
+    data->context.bind_data = bind_data;
+    data->io_context = duckdb_malloc(sizeof(duckdb_read_stat_io_context));
+    if (data->io_context == NULL)
+    {
+        duckdb_read_stat_init_data_set_error(data, "read_stat: out of memory");
+        return false;
+    }
+    memset(data->io_context, 0, sizeof(*data->io_context));
+
+    file_open_options = duckdb_create_file_open_options();
+    duckdb_file_open_options_set_flag(file_open_options, DUCKDB_FILE_FLAG_READ, true);
+    if (duckdb_file_system_open(bind_data->file_system, bind_data->path, file_open_options,
+                                &data->io_context->file_handle) != DuckDBSuccess)
+        data->io_context->file_handle = NULL;
+    duckdb_destroy_file_open_options(&file_open_options);
+
+    if (data->io_context->file_handle == NULL)
+    {
+        duckdb_read_stat_init_data_set_error(data, "read_stat: could not open file");
+        return false;
+    }
+
+    parser = readstat_parser_init();
+    if (parser == NULL)
+    {
+        duckdb_read_stat_init_data_set_error(data, "read_stat: out of memory");
+        return false;
+    }
+    data->parser = parser;
+
+    readstat_set_metadata_handler(parser, &duckdb_read_stat_handle_metadata);
+    readstat_set_variable_handler(parser, &duckdb_read_stat_handle_variable);
+    readstat_set_value_handler(parser, &duckdb_read_stat_handle_value);
+    readstat_set_error_handler(parser, &duckdb_read_stat_handle_error);
+    readstat_set_io_ctx(parser, data->io_context);
+    readstat_set_open_handler(parser, &duckdb_read_stat_handle_open);
+    readstat_set_close_handler(parser, &duckdb_read_stat_handle_close);
+    readstat_set_read_handler(parser, &duckdb_read_stat_handle_read);
+    readstat_set_seek_handler(parser, &duckdb_read_stat_handle_seek);
+
+    if (bind_data->encoding != NULL)
+        readstat_set_file_character_encoding(parser, bind_data->encoding);
+
+    data->reader = readstat_reader_open(parser, bind_data->readstat_format, bind_data->path,
+                                        &data->context, &error);
+    if (data->reader == NULL)
+    {
+        duckdb_read_stat_init_data_set_error(data, "read_stat: failed to open file reader");
+        duckdb_read_stat_init_data_close(data);
+        return false;
+    }
+
+    if (bind_data->index != NULL)
+        readstat_reader_set_index(data->reader, bind_data->index);
+
+    return true;
+}
+
+static int duckdb_read_stat_set_task_range(duckdb_read_stat_init_data *data,
+                                           idx_t start_row, idx_t row_count)
+{
+    readstat_error_t error = readstat_reader_set_range(data->reader, (int64_t)start_row, (int64_t)row_count);
+
+    if (error == READSTAT_OK)
+        return true;
+
+    duckdb_read_stat_init_data_set_error(data, readstat_error_message(error));
+    return false;
+}
+
+static int duckdb_read_stat_index_handle_metadata(readstat_metadata_t *metadata, void *ctx)
+{
+    (void)metadata;
+    (void)ctx;
+    return READSTAT_HANDLER_OK;
+}
+
+static int duckdb_read_stat_index_handle_variable(int index, readstat_variable_t *variable,
+                                                  const char *val_labels, void *ctx)
+{
+    (void)index;
+    (void)variable;
+    (void)val_labels;
+    (void)ctx;
+    return READSTAT_HANDLER_OK;
+}
+
+static void duckdb_read_stat_index_handle_error(const char *error_message, void *ctx)
+{
+    (void)error_message;
+    (void)ctx;
+}
+
+static int duckdb_read_stat_needs_index(const duckdb_read_stat_bind_data *data)
+{
+    if (data->configured_threads <= 1)
+        return false;
+    if (data->readstat_format == READSTAT_FILE_FORMAT_DTA)
+        return false;
+    if (data->readstat_format == READSTAT_FILE_FORMAT_SAV &&
+            data->compression == READSTAT_COMPRESS_NONE)
+        return false;
+
+    return data->readstat_format == READSTAT_FILE_FORMAT_SAV ||
+           data->readstat_format == READSTAT_FILE_FORMAT_POR ||
+           data->readstat_format == READSTAT_FILE_FORMAT_SAS7BDAT ||
+           data->readstat_format == READSTAT_FILE_FORMAT_XPORT;
+}
+
+static int duckdb_read_stat_build_index(duckdb_read_stat_bind_data *data)
+{
+    readstat_parser_t *parser;
+    duckdb_file_open_options file_open_options;
+    duckdb_file_handle file_handle = NULL;
+    duckdb_read_stat_io_context io_context;
+    readstat_index_t *index;
+    readstat_error_t error = READSTAT_OK;
+
+    if (!duckdb_read_stat_needs_index(data))
+        return true;
+
+    file_open_options = duckdb_create_file_open_options();
+    duckdb_file_open_options_set_flag(file_open_options, DUCKDB_FILE_FLAG_READ, true);
+    if (duckdb_file_system_open(data->file_system, data->path, file_open_options, &file_handle) != DuckDBSuccess)
+        file_handle = NULL;
+    duckdb_destroy_file_open_options(&file_open_options);
+
+    if (file_handle == NULL)
+        return true;
+
+    parser = readstat_parser_init();
+    if (parser == NULL)
+    {
+        duckdb_file_handle_close(file_handle);
+        duckdb_destroy_file_handle(&file_handle);
+        return true;
+    }
+
+    io_context.file_handle = file_handle;
+    readstat_set_metadata_handler(parser, &duckdb_read_stat_index_handle_metadata);
+    readstat_set_variable_handler(parser, &duckdb_read_stat_index_handle_variable);
+    readstat_set_error_handler(parser, &duckdb_read_stat_index_handle_error);
+    readstat_set_io_ctx(parser, &io_context);
+    readstat_set_open_handler(parser, &duckdb_read_stat_handle_open);
+    readstat_set_close_handler(parser, &duckdb_read_stat_handle_close);
+    readstat_set_read_handler(parser, &duckdb_read_stat_handle_read);
+    readstat_set_seek_handler(parser, &duckdb_read_stat_handle_seek);
+    readstat_set_row_limit(parser, 0);
+
+    if (data->encoding != NULL)
+        readstat_set_file_character_encoding(parser, data->encoding);
+
+    index = readstat_index_build(parser, data->readstat_format, data->path, data, &error);
+
+    readstat_parser_free(parser);
+    duckdb_file_handle_close(file_handle);
+    duckdb_destroy_file_handle(&file_handle);
+
+    if (index == NULL || error != READSTAT_OK)
+    {
+        readstat_index_free(index);
+        return true;
+    }
+
+    data->index = index;
+    {
+        int64_t index_row_count = readstat_index_get_row_count(index);
+        if (index_row_count >= 0)
+        {
+            data->row_count = index_row_count;
+            data->cardinality = (idx_t)index_row_count;
+        }
+    }
+
+    return true;
 }
 
 void duckdb_read_stat_bind(duckdb_bind_info info)
@@ -312,7 +651,6 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
     duckdb_read_stat_bind_data *data = duckdb_malloc(sizeof(duckdb_read_stat_bind_data));
     duckdb_read_stat_io_context io_context;
     duckdb_client_context client_context = NULL;
-    duckdb_file_system file_system;
     duckdb_file_open_options file_open_options;
     duckdb_file_handle file_handle = NULL;
     readstat_reader_t *reader = NULL;
@@ -327,13 +665,14 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
         return;
     }
 
+    memset(data, 0, sizeof(*data));
     data->bind_info = info;
     data->path = duckdb_get_varchar(path_value);
     data->format = format_value != NULL ? duckdb_get_varchar(format_value) : NULL;
     data->encoding = encoding_value != NULL ? duckdb_get_varchar(encoding_value) : NULL;
-    data->cardinality = 0;
-    data->error_message = NULL;
-    data->file_handle = NULL;
+    data->row_count = -1;
+    data->compression = READSTAT_COMPRESS_NONE;
+    data->configured_threads = 1;
 
     duckdb_destroy_value(&path_value);
     if (format_value != NULL)
@@ -350,14 +689,23 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
     }
 
     duckdb_table_function_get_client_context(info, &client_context);
-    file_system = duckdb_client_context_get_file_system(client_context);
+    {
+        duckdb_value threads_value = duckdb_client_context_get_config_option(client_context, "threads", NULL);
+        if (threads_value != NULL) {
+            int64_t threads = duckdb_get_int64(threads_value);
+            if (threads > 0)
+                data->configured_threads = (idx_t)threads;
+            duckdb_destroy_value(&threads_value);
+        }
+    }
+    data->file_system = duckdb_client_context_get_file_system(client_context);
     duckdb_destroy_client_context(&client_context);
+
     file_open_options = duckdb_create_file_open_options();
     duckdb_file_open_options_set_flag(file_open_options, DUCKDB_FILE_FLAG_READ, true);
-    if (duckdb_file_system_open(file_system, data->path, file_open_options, &file_handle) != DuckDBSuccess)
+    if (duckdb_file_system_open(data->file_system, data->path, file_open_options, &file_handle) != DuckDBSuccess)
         file_handle = NULL;
     duckdb_destroy_file_open_options(&file_open_options);
-    duckdb_destroy_file_system(&file_system);
 
     if (file_handle == NULL)
     {
@@ -387,6 +735,9 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
         readstat_reader_close(reader);
     readstat_parser_free(parser);
 
+    duckdb_file_handle_close(file_handle);
+    duckdb_destroy_file_handle(&file_handle);
+
     if (error != READSTAT_OK)
     {
         duckdb_bind_set_error(info, data->error_message != NULL ? data->error_message : "read_stat: failed to read file metadata");
@@ -394,69 +745,42 @@ void duckdb_read_stat_bind(duckdb_bind_info info)
         return;
     }
 
-    data->file_handle = file_handle;
-    duckdb_bind_set_cardinality(data->bind_info, data->cardinality, true);
+    duckdb_read_stat_build_index(data);
+    duckdb_read_stat_plan_tasks(data);
+    duckdb_bind_set_cardinality(data->bind_info, data->cardinality, data->row_count >= 0);
     duckdb_bind_set_bind_data(info, data, duckdb_read_stat_bind_data_free);
 }
 
 void duckdb_read_stat_init(duckdb_init_info info)
 {
     duckdb_read_stat_bind_data *bind_data = (duckdb_read_stat_bind_data *)duckdb_init_get_bind_data(info);
-    duckdb_read_stat_init_data *data = duckdb_malloc(sizeof(duckdb_read_stat_init_data));
-    readstat_parser_t *parser = readstat_parser_init();
-    readstat_error_t error = READSTAT_OK;
+    duckdb_read_stat_init_data *data;
 
-    if (data == NULL || parser == NULL)
+    if (bind_data == NULL)
     {
-        duckdb_init_set_error(info, "read_stat: out of memory");
-        if (parser != NULL)
-            readstat_parser_free(parser);
-        duckdb_free(data);
+        duckdb_init_set_error(info, "read_stat: missing bind data");
         return;
     }
 
-    memset(data, 0, sizeof(*data));
-    data->io_context = duckdb_malloc(sizeof(duckdb_read_stat_io_context));
-    if (data->io_context == NULL)
+    data = duckdb_read_stat_init_data_create();
+    if (data == NULL)
     {
         duckdb_init_set_error(info, "read_stat: out of memory");
-        readstat_parser_free(parser);
-        duckdb_free(data);
         return;
     }
 
-    data->parser = parser;
-    data->io_context->file_handle = bind_data->file_handle;
-    data->context.bind_data = bind_data;
-    data->context.data_chunk = NULL;
-    data->context.slot = 0;
-    data->context.last_obs_index = -1;
-    data->context.error_message = NULL;
+    duckdb_read_stat_reset_tasks(bind_data);
+    duckdb_init_set_max_threads(info, bind_data->max_threads);
+    duckdb_init_set_init_data(info, data, duckdb_read_stat_init_data_free);
+}
 
-    duckdb_file_handle_seek(bind_data->file_handle, 0);
+void duckdb_read_stat_local_init(duckdb_init_info info)
+{
+    duckdb_read_stat_init_data *data = duckdb_read_stat_init_data_create();
 
-    readstat_set_metadata_handler(parser, &duckdb_read_stat_handle_metadata);
-    readstat_set_variable_handler(parser, &duckdb_read_stat_handle_variable);
-    readstat_set_value_handler(parser, &duckdb_read_stat_handle_value);
-    readstat_set_error_handler(parser, &duckdb_read_stat_handle_error);
-    readstat_set_io_ctx(parser, data->io_context);
-    readstat_set_open_handler(parser, &duckdb_read_stat_handle_open);
-    readstat_set_close_handler(parser, &duckdb_read_stat_handle_close);
-    readstat_set_read_handler(parser, &duckdb_read_stat_handle_read);
-    readstat_set_seek_handler(parser, &duckdb_read_stat_handle_seek);
-    readstat_set_row_limit(parser, 0);
-
-    if (bind_data->encoding != NULL)
-        readstat_set_file_character_encoding(parser, bind_data->encoding);
-
-    data->reader = readstat_reader_open(parser, bind_data->readstat_format, bind_data->path, &data->context, &error);
-    if (data->reader == NULL)
+    if (data == NULL)
     {
-        duckdb_init_set_error(info, data->context.error_message != NULL ? data->context.error_message : "read_stat: failed to open file reader");
-        readstat_parser_free(parser);
-        duckdb_free(data->io_context);
-        duckdb_free(data->context.error_message);
-        duckdb_free(data);
+        duckdb_init_set_error(info, "read_stat: out of memory");
         return;
     }
 
@@ -805,44 +1129,97 @@ static int duckdb_read_stat_prepare_output(duckdb_read_stat_context *context, du
 
 void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk output)
 {
-    duckdb_read_stat_init_data *init_data = (duckdb_read_stat_init_data *)duckdb_function_get_init_data(info);
-    duckdb_read_stat_context *context = &init_data->context;
+    duckdb_read_stat_bind_data *bind_data =
+        (duckdb_read_stat_bind_data *)duckdb_function_get_bind_data(info);
+    duckdb_read_stat_init_data *init_data =
+        (duckdb_read_stat_init_data *)duckdb_function_get_local_init_data(info);
+    duckdb_read_stat_context *context;
     readstat_error_t error;
 
-    if (context->error_message != NULL)
+    if (init_data == NULL && bind_data != NULL && bind_data->max_threads <= 1)
+        init_data = (duckdb_read_stat_init_data *)duckdb_function_get_init_data(info);
+
+    if (bind_data == NULL || init_data == NULL)
     {
-        duckdb_function_set_error(info, context->error_message);
+        duckdb_function_set_error(info, "read_stat: missing reader state");
         duckdb_data_chunk_set_size(output, 0);
         return;
     }
 
-    if (init_data->reader == NULL || readstat_reader_is_eof(init_data->reader))
+    context = &init_data->context;
+    context->bind_data = bind_data;
+
+    for (;;)
     {
-        duckdb_data_chunk_set_size(output, 0);
+        idx_t start_row;
+        idx_t row_count;
+
+        if (context->error_message != NULL)
+        {
+            duckdb_function_set_error(info, context->error_message);
+            duckdb_data_chunk_set_size(output, 0);
+            return;
+        }
+
+        if (!init_data->has_task)
+        {
+            if (!duckdb_read_stat_claim_task(bind_data, &start_row, &row_count))
+            {
+                duckdb_read_stat_init_data_close(init_data);
+                duckdb_data_chunk_set_size(output, 0);
+                return;
+            }
+
+            if (init_data->reader == NULL && !duckdb_read_stat_open_reader(init_data, bind_data))
+            {
+                duckdb_function_set_error(info, context->error_message != NULL
+                                                    ? context->error_message
+                                                    : "read_stat: failed to open file reader");
+                duckdb_data_chunk_set_size(output, 0);
+                return;
+            }
+
+            if (bind_data->parallel && !duckdb_read_stat_set_task_range(init_data, start_row, row_count))
+            {
+                duckdb_function_set_error(info, context->error_message != NULL
+                                                    ? context->error_message
+                                                    : "read_stat: failed to position file reader");
+                duckdb_data_chunk_set_size(output, 0);
+                return;
+            }
+
+            init_data->has_task = true;
+        }
+
+        if (!duckdb_read_stat_prepare_output(context, output))
+        {
+            duckdb_function_set_error(info, "read_stat: out of memory");
+            duckdb_data_chunk_set_size(output, 0);
+            return;
+        }
+
+        context->slot = 0;
+        context->row_count = 0;
+        context->last_obs_index = -1;
+
+        do {
+            error = readstat_reader_read_rows(init_data->reader, duckdb_vector_size());
+            if (error != READSTAT_OK)
+            {
+                duckdb_function_set_error(info, context->error_message != NULL
+                                                    ? context->error_message
+                                                    : readstat_error_message(error));
+                duckdb_data_chunk_set_size(output, 0);
+                return;
+            }
+        } while (context->row_count == 0 && !readstat_reader_is_eof(init_data->reader));
+
+        if (readstat_reader_is_eof(init_data->reader))
+            init_data->has_task = false;
+
+        duckdb_data_chunk_set_size(output, context->row_count);
         return;
     }
-
-    if (!duckdb_read_stat_prepare_output(context, output))
-    {
-        duckdb_function_set_error(info, "read_stat: out of memory");
-        duckdb_data_chunk_set_size(output, 0);
-        return;
-    }
-
-    context->data_chunk = output;
-    context->slot = 0;
-    context->row_count = 0;
-    context->last_obs_index = -1;
-
-    error = readstat_reader_read_rows(init_data->reader, duckdb_vector_size());
-    if (error != READSTAT_OK)
-    {
-        duckdb_function_set_error(info, context->error_message != NULL ? context->error_message : readstat_error_message(error));
-        duckdb_data_chunk_set_size(output, 0);
-        return;
-    }
-
-    duckdb_data_chunk_set_size(output, context->row_count);
 }
 
 void duckdb_read_stat_register_read_stat_function(duckdb_connection connection)
@@ -858,6 +1235,7 @@ void duckdb_read_stat_register_read_stat_function(duckdb_connection connection)
 
     duckdb_table_function_set_bind(function, &duckdb_read_stat_bind);
     duckdb_table_function_set_init(function, &duckdb_read_stat_init);
+    duckdb_table_function_set_local_init(function, &duckdb_read_stat_local_init);
     duckdb_table_function_set_function(function, &duckdb_read_stat_function);
 
     duckdb_state result = duckdb_register_table_function(connection, function);
