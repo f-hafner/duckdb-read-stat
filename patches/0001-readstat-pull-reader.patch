@@ -1,8 +1,18 @@
 diff --git a/src/readstat.h b/src/readstat.h
-index c6ece53..07a5481 100644
+index c6ece53..d5acc11 100644
 --- a/src/readstat.h
 +++ b/src/readstat.h
-@@ -399,6 +399,33 @@ readstat_error_t readstat_set_handler_character_encoding(readstat_parser_t *pars
+@@ -105,7 +105,8 @@ typedef enum readstat_error_e {
+     READSTAT_ERROR_TOO_MANY_COLUMNS,
+     READSTAT_ERROR_NAME_IS_ZERO_LENGTH,
+     READSTAT_ERROR_BAD_TIMESTAMP_VALUE,
+-    READSTAT_ERROR_BAD_MR_STRING
++    READSTAT_ERROR_BAD_MR_STRING,
++    READSTAT_ERROR_UNSUPPORTED_OPERATION
+ } readstat_error_t;
+ 
+ const char *readstat_error_message(readstat_error_t error_code);
+@@ -399,6 +400,52 @@ readstat_error_t readstat_set_handler_character_encoding(readstat_parser_t *pars
  readstat_error_t readstat_set_row_limit(readstat_parser_t *parser, long row_limit);
  readstat_error_t readstat_set_row_offset(readstat_parser_t *parser, long row_offset);
  
@@ -25,19 +35,51 @@ index c6ece53..07a5481 100644
 +} readstat_file_format_t;
 +
 +typedef struct readstat_reader_s readstat_reader_t;
++typedef struct readstat_index_s readstat_index_t;
 +
 +readstat_reader_t *readstat_reader_open(readstat_parser_t *parser,
 +        readstat_file_format_t format, const char *path, void *user_ctx,
 +        readstat_error_t *out_error);
 +readstat_error_t readstat_reader_read_rows(readstat_reader_t *reader, size_t max_rows);
++
++/* Reposition an open reader at an arbitrary row range. This is only supported
++ * by formats with a cheap row-to-position mapping. The reader's EOF state is
++ * cleared. row_count < 0 means "until the end of the file". */
++readstat_error_t readstat_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count);
++
++/* Optional immutable row index used by set_range implementations that cannot
++ * derive a row offset arithmetically. Build once and share it between readers. */
++readstat_error_t readstat_reader_set_index(readstat_reader_t *reader,
++        const readstat_index_t *index);
++
++readstat_index_t *readstat_index_build(readstat_parser_t *parser,
++        readstat_file_format_t format, const char *path, void *user_ctx,
++        readstat_error_t *out_error);
++int64_t readstat_index_get_row_count(const readstat_index_t *index);
++void readstat_index_free(readstat_index_t *index);
++
 +int readstat_reader_is_eof(const readstat_reader_t *reader);
 +void readstat_reader_close(readstat_reader_t *reader);
 +
  /* Parse binary / portable files */
  readstat_error_t readstat_parse_dta(readstat_parser_t *parser, const char *path, void *user_ctx);
  readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path, void *user_ctx);
+diff --git a/src/readstat_error.c b/src/readstat_error.c
+index d5d84ab..727e047 100644
+--- a/src/readstat_error.c
++++ b/src/readstat_error.c
+@@ -122,5 +122,8 @@ const char *readstat_error_message(readstat_error_t error_code) {
+     if (error_code == READSTAT_ERROR_BAD_TIMESTAMP_VALUE)
+         return "The provided file timestamp is invalid";
+ 
++    if (error_code == READSTAT_ERROR_UNSUPPORTED_OPERATION)
++        return "The requested operation is not supported by this file format";
++
+     return "Unknown error";
+ }
 diff --git a/src/readstat_parser.c b/src/readstat_parser.c
-index e5c4625..eff19f6 100644
+index e5c4625..f20d13b 100644
 --- a/src/readstat_parser.c
 +++ b/src/readstat_parser.c
 @@ -1,6 +1,7 @@
@@ -48,10 +90,84 @@ index e5c4625..eff19f6 100644
  #include "readstat_io_unistd.h"
  
  readstat_parser_t *readstat_parser_init(void) {
-@@ -119,3 +120,87 @@ readstat_error_t readstat_set_row_offset(readstat_parser_t *parser, long row_off
+@@ -119,3 +120,191 @@ readstat_error_t readstat_set_row_offset(readstat_parser_t *parser, long row_off
      parser->row_offset = row_offset;
      return READSTAT_OK;
  }
++
++readstat_index_t *readstat_index_alloc(readstat_file_format_t format) {
++    readstat_index_t *index = calloc(1, sizeof(readstat_index_t));
++    if (index == NULL)
++        return NULL;
++    index->format = format;
++    return index;
++}
++
++readstat_error_t readstat_index_append(readstat_index_t *index,
++        const void *entry) {
++    if (index == NULL || index->entry_size == 0)
++        return READSTAT_ERROR_MALLOC;
++
++    if (index->count == index->capacity) {
++        size_t capacity = index->capacity ? index->capacity * 2 : 64;
++        void *entries = realloc(index->entries, capacity * index->entry_size);
++        if (entries == NULL)
++            return READSTAT_ERROR_MALLOC;
++        index->entries = entries;
++        index->capacity = capacity;
++    }
++
++    memcpy((char *)index->entries + index->count * index->entry_size,
++            entry, index->entry_size);
++    index->count++;
++    return READSTAT_OK;
++}
++
++void readstat_index_free(readstat_index_t *index) {
++    if (index == NULL)
++        return;
++    free(index->entries);
++    free(index);
++}
++
++int64_t readstat_index_get_row_count(const readstat_index_t *index) {
++    return index == NULL ? -1 : index->row_count;
++}
++
++readstat_index_t *readstat_index_build(readstat_parser_t *parser,
++        readstat_file_format_t format, const char *path, void *user_ctx,
++        readstat_error_t *out_error) {
++    readstat_error_t error = READSTAT_ERROR_UNSUPPORTED_OPERATION;
++    readstat_index_t *index = NULL;
++
++    if (parser == NULL) {
++        if (out_error)
++            *out_error = READSTAT_ERROR_PARSE;
++        return NULL;
++    }
++
++    switch (format) {
++        case READSTAT_FILE_FORMAT_SAV:
++            index = readstat_sav_index_build(parser, path, user_ctx, &error);
++            break;
++        case READSTAT_FILE_FORMAT_POR:
++            index = readstat_por_index_build(parser, path, user_ctx, &error);
++            break;
++        case READSTAT_FILE_FORMAT_SAS7BDAT:
++            index = readstat_sas7bdat_index_build(parser, path, user_ctx, &error);
++            break;
++        case READSTAT_FILE_FORMAT_XPORT:
++            index = readstat_xport_index_build(parser, path, user_ctx, &error);
++            break;
++        default:
++            error = READSTAT_ERROR_UNSUPPORTED_OPERATION;
++            break;
++    }
++
++    if (index == NULL && out_error)
++        *out_error = error;
++    return index;
++}
 +
 +readstat_reader_t *readstat_reader_alloc(readstat_parser_t *parser,
 +        readstat_file_format_t format, void *user_ctx) {
@@ -129,6 +245,36 @@ index e5c4625..eff19f6 100644
 +    return retval;
 +}
 +
++readstat_error_t readstat_reader_set_index(readstat_reader_t *reader,
++        const readstat_index_t *index) {
++    if (reader == NULL)
++        return READSTAT_ERROR_PARSE;
++    if (index != NULL && index->format != reader->format)
++        return READSTAT_ERROR_PARSE;
++    reader->index = index;
++    return READSTAT_OK;
++}
++
++readstat_error_t readstat_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count) {
++    readstat_error_t retval;
++
++    if (reader == NULL)
++        return READSTAT_ERROR_PARSE;
++    if (reader->error != READSTAT_OK)
++        return reader->error;
++    if (reader->set_range == NULL)
++        return READSTAT_ERROR_UNSUPPORTED_OPERATION;
++
++    retval = reader->set_range(reader, start_row, row_count);
++    if (retval == READSTAT_OK) {
++        reader->eof = 0;
++    } else {
++        reader->error = retval;
++    }
++    return retval;
++}
++
 +int readstat_reader_is_eof(const readstat_reader_t *reader) {
 +    return reader == NULL || reader->eof;
 +}
@@ -138,30 +284,46 @@ index e5c4625..eff19f6 100644
 +}
 diff --git a/src/readstat_reader.h b/src/readstat_reader.h
 new file mode 100644
-index 0000000..397089c
+index 0000000..41a0e62
 --- /dev/null
 +++ b/src/readstat_reader.h
-@@ -0,0 +1,33 @@
+@@ -0,0 +1,58 @@
 +#ifndef INCLUDE_READSTAT_READER_H
 +#define INCLUDE_READSTAT_READER_H
 +
 +#include "readstat.h"
++
++struct readstat_index_s {
++    readstat_file_format_t format;
++    int64_t row_count;
++    void *entries;
++    size_t count;
++    size_t capacity;
++    size_t entry_size;
++};
 +
 +struct readstat_reader_s {
 +    readstat_parser_t *parser;
 +    readstat_file_format_t format;
 +    void *user_ctx;
 +    void *ctx;
++    const readstat_index_t *index;
 +    int eof;
 +    int closed;
 +    readstat_error_t error;
 +    readstat_error_t (*read_rows)(readstat_reader_t *reader, size_t max_rows);
++    readstat_error_t (*set_range)(readstat_reader_t *reader,
++            int64_t start_row, int64_t row_count);
 +    void (*close)(readstat_reader_t *reader);
 +};
 +
 +readstat_reader_t *readstat_reader_alloc(readstat_parser_t *parser,
 +        readstat_file_format_t format, void *user_ctx);
 +void readstat_reader_free(readstat_reader_t *reader);
++
++readstat_index_t *readstat_index_alloc(readstat_file_format_t format);
++readstat_error_t readstat_index_append(readstat_index_t *index,
++        const void *entry);
 +
 +readstat_reader_t *readstat_dta_reader_open(readstat_parser_t *parser,
 +        const char *path, void *user_ctx, readstat_error_t *out_error);
@@ -174,9 +336,18 @@ index 0000000..397089c
 +readstat_reader_t *readstat_xport_reader_open(readstat_parser_t *parser,
 +        const char *path, void *user_ctx, readstat_error_t *out_error);
 +
++readstat_index_t *readstat_sav_index_build(readstat_parser_t *parser,
++        const char *path, void *user_ctx, readstat_error_t *out_error);
++readstat_index_t *readstat_xport_index_build(readstat_parser_t *parser,
++        const char *path, void *user_ctx, readstat_error_t *out_error);
++readstat_index_t *readstat_por_index_build(readstat_parser_t *parser,
++        const char *path, void *user_ctx, readstat_error_t *out_error);
++readstat_index_t *readstat_sas7bdat_index_build(readstat_parser_t *parser,
++        const char *path, void *user_ctx, readstat_error_t *out_error);
++
 +#endif
 diff --git a/src/sas/readstat_sas7bdat_read.c b/src/sas/readstat_sas7bdat_read.c
-index 1a745a7..2ca6065 100644
+index 1a745a7..febb48a 100644
 --- a/src/sas/readstat_sas7bdat_read.c
 +++ b/src/sas/readstat_sas7bdat_read.c
 @@ -10,6 +10,7 @@
@@ -187,7 +358,7 @@ index 1a745a7..2ca6065 100644
  
  typedef struct col_info_s {
      sas_text_ref_t  name_ref;
-@@ -88,8 +89,22 @@ typedef struct sas7bdat_ctx_s {
+@@ -88,8 +89,26 @@ typedef struct sas7bdat_ctx_s {
      char           error_buf[2048];
  
      unsigned int  rdc_compression:1;
@@ -202,15 +373,19 @@ index 1a745a7..2ca6065 100644
 +    size_t        page_data_len;
 +    uint32_t      page_data_row_count;
 +    uint32_t      page_data_row_index;
++    uint16_t      pending_shp_index;
++    int           pending_shp_index_set;
  } sas7bdat_ctx_t;
  
 +static readstat_error_t sas7bdat_reader_read_rows(readstat_reader_t *reader, size_t max_rows);
++static readstat_error_t sas7bdat_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count);
 +static void sas7bdat_reader_close(readstat_reader_t *reader);
 +
  static void sas7bdat_ctx_free(sas7bdat_ctx_t *ctx) {
      int i;
      if (ctx->text_blobs) {
-@@ -126,6 +141,8 @@ static void sas7bdat_ctx_free(sas7bdat_ctx_t *ctx) {
+@@ -126,6 +145,8 @@ static void sas7bdat_ctx_free(sas7bdat_ctx_t *ctx) {
  
  static readstat_error_t sas7bdat_update_progress(sas7bdat_ctx_t *ctx) {
      readstat_io_t *io = ctx->io;
@@ -219,7 +394,7 @@ index 1a745a7..2ca6065 100644
      return io->update(ctx->file_size, ctx->handle.progress, ctx->user_ctx, io->io_ctx);
  }
  
-@@ -455,11 +472,15 @@ static readstat_error_t sas7bdat_parse_single_row(const char *data, sas7bdat_ctx
+@@ -455,11 +476,15 @@ static readstat_error_t sas7bdat_parse_single_row(const char *data, sas7bdat_ctx
      readstat_error_t retval = READSTAT_OK;
      int j;
      if (ctx->handle.value) {
@@ -240,7 +415,7 @@ index 1a745a7..2ca6065 100644
          }
  
          for (j=0; j<ctx->column_count; j++) {
-@@ -506,7 +527,7 @@ cleanup:
+@@ -506,7 +531,7 @@ cleanup:
  static readstat_error_t sas7bdat_parse_subheader_rdc(const char *subheader, size_t len, sas7bdat_ctx_t *ctx) {
      readstat_error_t retval = READSTAT_OK;
      const unsigned char *input = (const unsigned char *)subheader;
@@ -249,7 +424,7 @@ index 1a745a7..2ca6065 100644
      char *output = buffer;
      while (input + 2 <= (const unsigned char *)subheader + len) {
          int i;
-@@ -586,8 +607,6 @@ static readstat_error_t sas7bdat_parse_subheader_rdc(const char *subheader, size
+@@ -586,8 +611,6 @@ static readstat_error_t sas7bdat_parse_subheader_rdc(const char *subheader, size
      }
      retval = sas7bdat_parse_single_row(buffer, ctx);
  cleanup:
@@ -258,7 +433,7 @@ index 1a745a7..2ca6065 100644
      return retval;
  }
  
-@@ -903,105 +922,238 @@ cleanup:
+@@ -903,105 +926,238 @@ cleanup:
      return retval;
  }
  
@@ -315,7 +490,7 @@ index 1a745a7..2ca6065 100644
 +    const char *page = ctx->page;
 +    const char *shp = &page[ctx->page_header_size + ctx->shp_count*ctx->subheader_pointer_size];
 +    const char *data;
- 
++
 +    if ((shp-page)%8 == 4 && shp + 4 <= page + ctx->page_size &&
 +            (*(uint32_t *)shp == 0x00000000 ||
 +             *(uint32_t *)shp == 0x20202020 ||
@@ -330,7 +505,7 @@ index 1a745a7..2ca6065 100644
 +    ctx->page_data_row_count = ctx->page_row_count;
 +    ctx->page_data_row_index = 0;
 +}
-+
+ 
 +static readstat_error_t sas7bdat_process_metadata_page(sas7bdat_ctx_t *ctx) {
      readstat_error_t retval = READSTAT_OK;
 +    const char *page = ctx->page;
@@ -577,11 +752,71 @@ index 1a745a7..2ca6065 100644
  }
  
  static readstat_error_t sas7bdat_parse_meta_pages_pass1(sas7bdat_ctx_t *ctx, int64_t *outLastExaminedPage) {
-@@ -1131,46 +1283,78 @@ cleanup:
+@@ -1131,46 +1287,146 @@ cleanup:
      return retval;
  }
  
 -static readstat_error_t sas7bdat_parse_all_pages_pass2(sas7bdat_ctx_t *ctx) {
++typedef struct sas_page_checkpoint_s {
++    int64_t  first_row;
++    uint32_t page_index;
++    uint16_t shp_index;
++} sas_page_checkpoint_t;
++
++static readstat_error_t sas7bdat_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count) {
++    sas7bdat_ctx_t *ctx = (sas7bdat_ctx_t *)reader->ctx;
++    const sas_page_checkpoint_t *checkpoints;
++    const sas_page_checkpoint_t *checkpoint;
++    int64_t remaining;
++    int64_t row_limit;
++    size_t lo = 0, hi;
++    int64_t page_offset;
++
++    if (ctx == NULL || reader->index == NULL || reader->index->entry_size != sizeof(sas_page_checkpoint_t) ||
++            reader->index->count == 0)
++        return READSTAT_ERROR_UNSUPPORTED_OPERATION;
++
++    if (start_row < 0)
++        start_row = 0;
++    if (start_row > reader->index->row_count)
++        start_row = reader->index->row_count;
++
++    remaining = reader->index->row_count - start_row;
++    row_limit = row_count < 0 || row_count > remaining ? remaining : row_count;
++    if (row_limit > UINT32_MAX)
++        row_limit = UINT32_MAX;
++
++    checkpoints = (const sas_page_checkpoint_t *)reader->index->entries;
++    hi = reader->index->count;
++    while (lo < hi) {
++        size_t mid = lo + (hi - lo) / 2;
++        if (checkpoints[mid].first_row <= start_row)
++            lo = mid + 1;
++        else
++            hi = mid;
++    }
++    if (lo == 0)
++        return READSTAT_ERROR_PARSE;
++    checkpoint = &checkpoints[lo - 1];
++
++    page_offset = ctx->header_size + (int64_t)checkpoint->page_index * ctx->page_size;
++    if (ctx->io->seek(page_offset, READSTAT_SEEK_SET, ctx->io->io_ctx) == -1)
++        return READSTAT_ERROR_SEEK;
++
++    ctx->current_page = checkpoint->page_index;
++    ctx->page_loaded = 0;
++    ctx->page_done = 0;
++    sas7bdat_reset_page_state(ctx);
++    ctx->pending_shp_index = checkpoint->shp_index;
++    ctx->pending_shp_index_set = 1;
++    ctx->parsed_row_count = 0;
++    ctx->row_offset = (uint32_t)(start_row - checkpoint->first_row);
++    ctx->row_limit = (uint32_t)row_limit;
++
++    return READSTAT_OK;
++}
++
 +static readstat_error_t sas7bdat_reader_read_rows(readstat_reader_t *reader, size_t max_rows) {
 +    sas7bdat_ctx_t *ctx = (sas7bdat_ctx_t *)reader->ctx;
 +    uint32_t start = ctx->parsed_row_count;
@@ -614,6 +849,14 @@ index 1a745a7..2ca6065 100644
 +
 +            if ((retval = sas7bdat_load_page_pass2(ctx)) != READSTAT_OK)
 +                return retval;
++
++            if (ctx->pending_shp_index_set) {
++                ctx->shp_index = ctx->pending_shp_index;
++                ctx->pending_shp_index_set = 0;
++                if ((ctx->page_type & SAS_PAGE_TYPE_MASK) == SAS_PAGE_TYPE_MIX &&
++                        ctx->shp_index >= ctx->shp_count)
++                    sas7bdat_set_mix_data_area(ctx);
++            }
 +
 +            if (ctx->page_done) {
 +                ctx->page_loaded = 0;
@@ -680,7 +923,7 @@ index 1a745a7..2ca6065 100644
      ctx->handle = parser->handlers;
      ctx->input_encoding = parser->input_encoding;
      ctx->output_encoding = parser->output_encoding;
-@@ -1242,6 +1426,9 @@ readstat_error_t readstat_parse_sas7bdat(readstat_parser_t *parser, const char *
+@@ -1242,6 +1498,9 @@ readstat_error_t readstat_parse_sas7bdat(readstat_parser_t *parser, const char *
          goto cleanup;
      }
  
@@ -690,7 +933,7 @@ index 1a745a7..2ca6065 100644
      if ((retval = sas7bdat_parse_meta_pages_pass1(ctx, &last_examined_page_pass1)) != READSTAT_OK) {
          goto cleanup;
      }
-@@ -1253,52 +1440,114 @@ readstat_error_t readstat_parse_sas7bdat(readstat_parser_t *parser, const char *
+@@ -1253,52 +1512,195 @@ readstat_error_t readstat_parse_sas7bdat(readstat_parser_t *parser, const char *
      if (io->seek(ctx->header_size, READSTAT_SEEK_SET, io->io_ctx) == -1) {
          retval = READSTAT_ERROR_SEEK;
          if (ctx->handle.error) {
@@ -769,18 +1012,19 @@ index 1a745a7..2ca6065 100644
      }
 +    reader->ctx = ctx;
 +    reader->read_rows = sas7bdat_reader_read_rows;
++    reader->set_range = sas7bdat_reader_set_range;
 +    reader->close = sas7bdat_reader_close;
  
 -cleanup:
 -    io->close(io->io_ctx);
 +    if (!ctx->page_loaded && ctx->current_page >= ctx->page_count)
 +        reader->eof = 1;
- 
++
 +    if (out_error)
 +        *out_error = READSTAT_OK;
 +
 +    return reader;
-+
+ 
 +cleanup:
      if (retval == READSTAT_ERROR_OPEN ||
              retval == READSTAT_ERROR_READ ||
@@ -807,6 +1051,86 @@ index 1a745a7..2ca6065 100644
 +    return NULL;
 +}
 +
++static readstat_error_t sas7bdat_build_index(sas7bdat_ctx_t *ctx, readstat_index_t *index) {
++    index->entry_size = sizeof(sas_page_checkpoint_t);
++
++    while (1) {
++        uint32_t before;
++        int64_t page_index;
++        readstat_error_t retval;
++
++        if (!ctx->page_loaded) {
++            retval = sas7bdat_load_page_pass2(ctx);
++            if (retval != READSTAT_OK)
++                return retval;
++            if (ctx->page_done) {
++                ctx->page_loaded = 0;
++                if (ctx->current_page >= ctx->page_count)
++                    break;
++                continue;
++            }
++        }
++
++        before = ctx->parsed_row_count;
++        page_index = ctx->current_page - 1;
++        {
++            uint16_t start_shp_index = ctx->shp_index;
++            retval = sas7bdat_process_current_page(ctx, (size_t)-1);
++            if (retval == READSTAT_OK && ctx->parsed_row_count > before) {
++                sas_page_checkpoint_t checkpoint = {
++                    .first_row = before,
++                    .page_index = (uint32_t)page_index,
++                    .shp_index = start_shp_index
++                };
++                retval = readstat_index_append(index, &checkpoint);
++            }
++        }
++        if (retval != READSTAT_OK)
++            return retval;
++
++        ctx->page_loaded = 0;
++        if (ctx->current_page >= ctx->page_count)
++            break;
++    }
++
++    index->row_count = ctx->parsed_row_count;
++    return READSTAT_OK;
++}
++
++readstat_index_t *readstat_sas7bdat_index_build(readstat_parser_t *parser,
++        const char *path, void *user_ctx, readstat_error_t *out_error) {
++    readstat_value_handler old_value_handler = parser->handlers.value;
++    readstat_error_t error = READSTAT_OK;
++    readstat_index_t *index = NULL;
++    readstat_reader_t *reader = NULL;
++
++    parser->handlers.value = NULL;
++    reader = readstat_sas7bdat_reader_open(parser, path, user_ctx, &error);
++    parser->handlers.value = old_value_handler;
++
++    if (reader == NULL)
++        goto cleanup;
++
++    index = readstat_index_alloc(READSTAT_FILE_FORMAT_SAS7BDAT);
++    if (index == NULL) {
++        error = READSTAT_ERROR_MALLOC;
++        goto cleanup;
++    }
++
++    error = sas7bdat_build_index((sas7bdat_ctx_t *)reader->ctx, index);
++
++cleanup:
++    if (reader)
++        readstat_reader_close(reader);
++    if (error != READSTAT_OK) {
++        readstat_index_free(index);
++        index = NULL;
++    }
++    if (out_error)
++        *out_error = error;
++    return index;
++}
++
 +readstat_error_t readstat_parse_sas7bdat(readstat_parser_t *parser, const char *path, void *user_ctx) {
 +    readstat_error_t error = READSTAT_OK;
 +    readstat_reader_t *reader = readstat_sas7bdat_reader_open(parser, path, user_ctx, &error);
@@ -827,10 +1151,17 @@ index 1a745a7..2ca6065 100644
 +    return READSTAT_OK;
  }
 diff --git a/src/sas/readstat_xport_read.c b/src/sas/readstat_xport_read.c
-index 6bd9ddb..2d72be7 100644
+index 6bd9ddb..75a507f 100644
 --- a/src/sas/readstat_xport_read.c
 +++ b/src/sas/readstat_xport_read.c
-@@ -9,6 +9,7 @@
+@@ -3,12 +3,14 @@
+ #include <string.h>
+ #include <sys/types.h>
+ #include <stdint.h>
++#include <limits.h>
+ #include <time.h>
+ 
+ #include "../readstat.h"
  #include "../readstat_iconv.h"
  #include "../readstat_convert.h"
  #include "../readstat_malloc.h"
@@ -838,7 +1169,7 @@ index 6bd9ddb..2d72be7 100644
  #include "readstat_sas.h"
  #include "readstat_xport.h"
  #include "ieee.h"
-@@ -38,10 +39,21 @@ typedef struct xport_ctx_s {
+@@ -38,10 +40,21 @@ typedef struct xport_ctx_s {
      readstat_variable_t **variables;
  
      int            version;
@@ -860,7 +1191,7 @@ index 6bd9ddb..2d72be7 100644
      return io->update(ctx->file_size, ctx->handle.progress, ctx->user_ctx, io->io_ctx);
  }
  
-@@ -62,10 +74,19 @@ static void xport_ctx_free(xport_ctx_t *ctx) {
+@@ -62,10 +75,21 @@ static void xport_ctx_free(xport_ctx_t *ctx) {
      if (ctx->converter) {
          iconv_close(ctx->converter);
      }
@@ -875,12 +1206,14 @@ index 6bd9ddb..2d72be7 100644
  }
  
 +static readstat_error_t xport_reader_read_rows(readstat_reader_t *reader, size_t max_rows);
++static readstat_error_t xport_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count);
 +static void xport_reader_close(readstat_reader_t *reader);
 +
  static ssize_t read_bytes(xport_ctx_t *ctx, void *dst, size_t dst_len) {
      readstat_io_t *io = (readstat_io_t *)ctx->io;
      return io->read(dst, dst_len, io->io_ctx);
-@@ -552,23 +573,27 @@ static readstat_error_t xport_process_row(xport_ctx_t *ctx, const char *row, siz
+@@ -552,23 +576,27 @@ static readstat_error_t xport_process_row(xport_ctx_t *ctx, const char *row, siz
      readstat_error_t retval = READSTAT_OK;
      int i;
      off_t pos = 0;
@@ -915,7 +1248,7 @@ index 6bd9ddb..2d72be7 100644
          } else {
              double dval = NAN;
              if (variable->storage_width <= XPORT_MAX_DOUBLE_SIZE &&
-@@ -610,89 +635,112 @@ static readstat_error_t xport_process_row(xport_ctx_t *ctx, const char *row, siz
+@@ -610,89 +638,236 @@ static readstat_error_t xport_process_row(xport_ctx_t *ctx, const char *row, siz
      }
  
  cleanup:
@@ -970,8 +1303,137 @@ index 6bd9ddb..2d72be7 100644
 -        }
 +    return READSTAT_OK;
 +}
++
++#define XPORT_INDEX_INTERVAL 2048
++
++typedef struct xport_checkpoint_s {
++    int64_t first_row;
++    int64_t file_offset;
++} xport_checkpoint_t;
++
++static readstat_error_t xport_add_checkpoint(xport_ctx_t *ctx,
++        readstat_index_t *index, int64_t row) {
++    xport_checkpoint_t checkpoint;
++    readstat_off_t file_pos = ctx->io->seek(0, READSTAT_SEEK_CUR, ctx->io->io_ctx);
  
 -        off_t pos = 0;
++    if (file_pos == -1)
++        return READSTAT_ERROR_SEEK;
++
++    checkpoint.first_row = row;
++    checkpoint.file_offset = file_pos;
++    return readstat_index_append(index, &checkpoint);
++}
++
++static readstat_error_t xport_build_index(xport_ctx_t *ctx, readstat_index_t *index) {
++    readstat_error_t retval = READSTAT_OK;
++    int64_t row_count = 0;
++    int64_t blank_rows = 0;
++    int64_t next_checkpoint = XPORT_INDEX_INTERVAL;
++
++    index->entry_size = sizeof(xport_checkpoint_t);
++    ctx->pending_row = 0;
++    ctx->num_blank_rows = 0;
++    ctx->data_finished = 0;
++
++    if ((retval = xport_add_checkpoint(ctx, index, 0)) != READSTAT_OK)
++        return retval;
+ 
++    if (ctx->row_length == 0) {
++        index->row_count = 0;
++        return READSTAT_OK;
++    }
++
++    while (1) {
++        ssize_t bytes_read = read_bytes(ctx, ctx->row, ctx->row_length);
+         int row_is_blank = 1;
++        size_t pos;
+ 
+-        for (pos=0; pos<ctx->row_length; pos++) {
+-            if (row[pos] != ' ') {
++        if (bytes_read == -1)
++            return READSTAT_ERROR_READ;
++        if (bytes_read < (ssize_t)ctx->row_length)
++            break;
++
++        for (pos = 0; pos < ctx->row_length; pos++) {
++            if (ctx->row[pos] != ' ') {
+                 row_is_blank = 0;
+                 break;
+             }
+         }
+ 
+         if (row_is_blank) {
+-            num_blank_rows++;
++            blank_rows++;
+             continue;
+         }
+ 
+-        while (num_blank_rows) {
+-            retval = xport_process_row(ctx, blank_row, ctx->row_length);
++        row_count += blank_rows + 1;
++        blank_rows = 0;
++
++        if (row_count >= next_checkpoint) {
++            if ((retval = xport_add_checkpoint(ctx, index, row_count)) != READSTAT_OK)
++                return retval;
++            next_checkpoint = row_count + XPORT_INDEX_INTERVAL;
++        }
++    }
++
++    index->row_count = row_count;
++    return READSTAT_OK;
++}
++
++static readstat_error_t xport_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count) {
++    xport_ctx_t *ctx = (xport_ctx_t *)reader->ctx;
++    const xport_checkpoint_t *checkpoints;
++    const xport_checkpoint_t *checkpoint;
++    int64_t remaining;
++    int64_t row_limit;
++    size_t lo = 0, hi;
++
++    if (ctx == NULL || reader->index == NULL || reader->index->entry_size != sizeof(xport_checkpoint_t) ||
++            reader->index->count == 0)
++        return READSTAT_ERROR_UNSUPPORTED_OPERATION;
++
++    if (start_row < 0)
++        start_row = 0;
++    if (start_row > reader->index->row_count)
++        start_row = reader->index->row_count;
++
++    remaining = reader->index->row_count - start_row;
++    row_limit = row_count < 0 || row_count > remaining ? remaining : row_count;
++    if (row_limit > INT_MAX)
++        row_limit = INT_MAX;
++
++    checkpoints = (const xport_checkpoint_t *)reader->index->entries;
++    hi = reader->index->count;
++    while (lo < hi) {
++        size_t mid = lo + (hi - lo) / 2;
++        if (checkpoints[mid].first_row <= start_row)
++            lo = mid + 1;
++        else
++            hi = mid;
++    }
++    if (lo == 0)
++        return READSTAT_ERROR_PARSE;
++    checkpoint = &checkpoints[lo - 1];
++
++    if (ctx->io->seek(checkpoint->file_offset, READSTAT_SEEK_SET, ctx->io->io_ctx) == -1)
++        return READSTAT_ERROR_SEEK;
++
++    ctx->pending_row = 0;
++    ctx->num_blank_rows = 0;
++    ctx->data_finished = 0;
++    ctx->parsed_row_count = 0;
++    ctx->row_offset = (int)(start_row - checkpoint->first_row);
++    ctx->row_limit = (int)row_limit;
++
++    return READSTAT_OK;
++}
++
 +static readstat_error_t xport_read_rows(xport_ctx_t *ctx, size_t max_rows, size_t *out_rows) {
 +    readstat_error_t retval = READSTAT_OK;
 +
@@ -981,10 +1443,12 @@ index 6bd9ddb..2d72be7 100644
 +            (ctx->row_limit <= 0 || ctx->parsed_row_count < ctx->row_limit)) {
 +        if (ctx->pending_row && ctx->num_blank_rows) {
 +            retval = xport_process_row(ctx, ctx->blank_row, ctx->row_length);
-+            if (retval != READSTAT_OK)
+             if (retval != READSTAT_OK)
+-                goto cleanup;
 +                goto done;
  
--        int row_is_blank = 1;
+-            if (ctx->row_limit > 0 && ctx->parsed_row_count == ctx->row_limit)
+-                goto cleanup;
 +            ctx->num_blank_rows--;
 +            (*out_rows)++;
 +        } else if (ctx->pending_row) {
@@ -992,58 +1456,43 @@ index 6bd9ddb..2d72be7 100644
 +            if (retval != READSTAT_OK)
 +                goto done;
  
--        for (pos=0; pos<ctx->row_length; pos++) {
--            if (row[pos] != ' ') {
--                row_is_blank = 0;
+-            num_blank_rows--;
+-        }
 +            ctx->pending_row = 0;
 +            (*out_rows)++;
 +        } else {
 +            ssize_t bytes_read = read_bytes(ctx, ctx->row, ctx->row_length);
 +            off_t pos;
 +            int row_is_blank = 1;
-+
+ 
+-        retval = xport_process_row(ctx, row, ctx->row_length);
+-        if (retval != READSTAT_OK)
+-            goto cleanup;
 +            if (bytes_read == -1) {
 +                retval = READSTAT_ERROR_READ;
 +                goto done;
 +            }
 +            if (bytes_read < (ssize_t)ctx->row_length) {
 +                ctx->data_finished = 1;
-                 break;
-             }
--        }
- 
--        if (row_is_blank) {
--            num_blank_rows++;
--            continue;
--        }
--
--        while (num_blank_rows) {
--            retval = xport_process_row(ctx, blank_row, ctx->row_length);
--            if (retval != READSTAT_OK)
--                goto cleanup;
++                break;
++            }
++
 +            for (pos=0; pos<(off_t)ctx->row_length; pos++) {
 +                if (ctx->row[pos] != ' ') {
 +                    row_is_blank = 0;
 +                    break;
 +                }
 +            }
- 
--            if (ctx->row_limit > 0 && ctx->parsed_row_count == ctx->row_limit)
--                goto cleanup;
++
 +            if (row_is_blank) {
 +                ctx->num_blank_rows++;
 +                continue;
 +            }
- 
--            num_blank_rows--;
++
 +            ctx->pending_row = 1;
 +            continue;
-         }
++        }
  
--        retval = xport_process_row(ctx, row, ctx->row_length);
--        if (retval != READSTAT_OK)
--            goto cleanup;
--
          retval = xport_update_progress(ctx);
          if (retval != READSTAT_OK)
 -            goto cleanup;
@@ -1078,7 +1527,7 @@ index 6bd9ddb..2d72be7 100644
      ctx->handle = parser->handlers;
      ctx->input_encoding = parser->input_encoding;
      ctx->output_encoding = parser->output_encoding;
-@@ -762,16 +810,80 @@ readstat_error_t readstat_parse_xport(readstat_parser_t *parser, const char *pat
+@@ -762,16 +937,124 @@ readstat_error_t readstat_parse_xport(readstat_parser_t *parser, const char *pat
      if (retval != READSTAT_OK)
          goto cleanup;
  
@@ -1097,6 +1546,7 @@ index 6bd9ddb..2d72be7 100644
      }
 +    reader->ctx = ctx;
 +    reader->read_rows = xport_reader_read_rows;
++    reader->set_range = xport_reader_set_range;
 +    reader->close = xport_reader_close;
 +
 +    if (out_error)
@@ -1147,6 +1597,49 @@ index 6bd9ddb..2d72be7 100644
 +    reader->closed = 1;
 +}
 +
++static int xport_index_value_handler(int obs_index, readstat_variable_t *variable,
++        readstat_value_t value, void *ctx) {
++    (void)obs_index;
++    (void)variable;
++    (void)value;
++    (void)ctx;
++    return READSTAT_HANDLER_OK;
++}
++
++readstat_index_t *readstat_xport_index_build(readstat_parser_t *parser,
++        const char *path, void *user_ctx, readstat_error_t *out_error) {
++    readstat_value_handler old_value_handler = parser->handlers.value;
++    readstat_error_t error = READSTAT_OK;
++    readstat_index_t *index = NULL;
++    readstat_reader_t *reader = NULL;
++
++    parser->handlers.value = xport_index_value_handler;
++    reader = readstat_xport_reader_open(parser, path, user_ctx, &error);
++    parser->handlers.value = old_value_handler;
++
++    if (reader == NULL)
++        goto cleanup;
++
++    index = readstat_index_alloc(READSTAT_FILE_FORMAT_XPORT);
++    if (index == NULL) {
++        error = READSTAT_ERROR_MALLOC;
++        goto cleanup;
++    }
++
++    error = xport_build_index((xport_ctx_t *)reader->ctx, index);
++
++cleanup:
++    if (reader)
++        readstat_reader_close(reader);
++    if (error != READSTAT_OK) {
++        readstat_index_free(index);
++        index = NULL;
++    }
++    if (out_error)
++        *out_error = error;
++    return index;
++}
++
 +readstat_error_t readstat_parse_xport(readstat_parser_t *parser, const char *path, void *user_ctx) {
 +    readstat_error_t error = READSTAT_OK;
 +    readstat_reader_t *reader = readstat_xport_reader_open(parser, path, user_ctx, &error);
@@ -1167,23 +1660,32 @@ index 6bd9ddb..2d72be7 100644
 +    return READSTAT_OK;
 +}
 diff --git a/src/spss/readstat_por.h b/src/spss/readstat_por.h
-index e169d68..da78f65 100644
+index e169d68..025ec40 100644
 --- a/src/spss/readstat_por.h
 +++ b/src/spss/readstat_por.h
-@@ -29,6 +29,8 @@ typedef struct por_ctx_s {
+@@ -29,6 +29,9 @@ typedef struct por_ctx_s {
      readstat_variable_t **variables;
      spss_varinfo_t *varinfo;
      ck_hash_table_t *var_dict;
 +    int data_started;
 +    int data_finished;
++    int index_only;
  } por_ctx_t;
  
  por_ctx_t *por_ctx_init(void);
 diff --git a/src/spss/readstat_por_read.c b/src/spss/readstat_por_read.c
-index 44dc0f4..bd1931c 100644
+index 44dc0f4..18457ad 100644
 --- a/src/spss/readstat_por_read.c
 +++ b/src/spss/readstat_por_read.c
-@@ -15,6 +15,7 @@
+@@ -7,6 +7,7 @@
+ #include <string.h>
+ #include <sys/types.h>
+ #include <stdint.h>
++#include <limits.h>
+ #include <inttypes.h>
+ #include <math.h>
+ #include <time.h>
+@@ -15,6 +16,7 @@
  #include "../readstat_iconv.h"
  #include "../readstat_convert.h"
  #include "../readstat_malloc.h"
@@ -1191,11 +1693,13 @@ index 44dc0f4..bd1931c 100644
  #include "../CKHashTable.h"
  
  #include "readstat_por_parse.h"
-@@ -39,8 +40,13 @@
+@@ -39,8 +41,15 @@
  static ssize_t read_bytes(por_ctx_t *ctx, void *dst, size_t len);
  static readstat_error_t read_string(por_ctx_t *ctx, char *data, size_t len);
  
 +static readstat_error_t por_reader_read_rows(readstat_reader_t *reader, size_t max_rows);
++static readstat_error_t por_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count);
 +static void por_reader_close(readstat_reader_t *reader);
 +
  static readstat_error_t por_update_progress(por_ctx_t *ctx) {
@@ -1205,7 +1709,7 @@ index 44dc0f4..bd1931c 100644
      return io->update(ctx->file_size, ctx->handle.progress, ctx->user_ctx, io->io_ctx);
  }
  
-@@ -584,17 +590,22 @@ cleanup:
+@@ -584,17 +593,22 @@ cleanup:
      return retval;
  }
  
@@ -1231,7 +1735,7 @@ index 44dc0f4..bd1931c 100644
          int finished = 0;
          for (i=0; i<ctx->var_count; i++) {
              spss_varinfo_t *info = &ctx->varinfo[i];
-@@ -604,60 +615,63 @@ static readstat_error_t read_por_file_data(por_ctx_t *ctx) {
+@@ -604,63 +618,177 @@ static readstat_error_t read_por_file_data(por_ctx_t *ctx) {
                  rs_retval = maybe_read_string(ctx, input_string, sizeof(input_string), &finished);
                  if (rs_retval != READSTAT_OK) {
                      if (ctx->handle.error) {
@@ -1249,13 +1753,21 @@ index 44dc0f4..bd1931c 100644
 +                    ctx->data_finished = 1;
 +                    goto done;
                  }
-                 rs_retval = readstat_convert(output_string, sizeof(output_string),
-                         input_string, strlen(input_string), ctx->converter);
-                 if (rs_retval != READSTAT_OK) {
+-                rs_retval = readstat_convert(output_string, sizeof(output_string),
+-                        input_string, strlen(input_string), ctx->converter);
+-                if (rs_retval != READSTAT_OK) {
 -                    goto cleanup;
-+                    goto done;
++                if (ctx->index_only) {
++                    value.v.string_value = input_string;
++                } else {
++                    rs_retval = readstat_convert(output_string, sizeof(output_string),
++                            input_string, strlen(input_string), ctx->converter);
++                    if (rs_retval != READSTAT_OK) {
++                        goto done;
++                    }
++                    value.v.string_value = output_string;
                  }
-                 value.v.string_value = output_string;
+-                value.v.string_value = output_string;
              } else if (info->type == READSTAT_TYPE_DOUBLE) {
                  rs_retval = maybe_read_double(ctx, &value.v.double_value, &finished);
                  if (rs_retval != READSTAT_OK) {
@@ -1276,7 +1788,8 @@ index 44dc0f4..bd1931c 100644
                  }
                  value.is_system_missing = isnan(value.v.double_value);
              }
-             if (ctx->handle.value && !ctx->variables[i]->skip && !ctx->row_offset) {
+-            if (ctx->handle.value && !ctx->variables[i]->skip && !ctx->row_offset) {
++            if (!ctx->index_only && ctx->handle.value && !ctx->variables[i]->skip && !ctx->row_offset) {
                  if (ctx->handle.value(ctx->obs_count, ctx->variables[i], value, ctx->user_ctx) != READSTAT_HANDLER_OK) {
                      rs_retval = READSTAT_ERROR_USER_ABORT;
 -                    goto cleanup;
@@ -1308,7 +1821,117 @@ index 44dc0f4..bd1931c 100644
      return rs_retval;
  }
  
-@@ -744,15 +758,21 @@ cleanup:
++#define POR_INDEX_INTERVAL 2048
++
++typedef struct por_checkpoint_s {
++    int64_t first_row;
++    int64_t file_offset;
++    int     pos;
++    long    num_spaces;
++} por_checkpoint_t;
++
++static readstat_error_t por_add_checkpoint(por_ctx_t *ctx,
++        readstat_index_t *index, int64_t row) {
++    por_checkpoint_t checkpoint;
++    readstat_off_t file_pos = ctx->io->seek(0, READSTAT_SEEK_CUR, ctx->io->io_ctx);
++
++    if (file_pos == -1)
++        return READSTAT_ERROR_SEEK;
++
++    checkpoint.first_row = row;
++    checkpoint.file_offset = file_pos;
++    checkpoint.pos = ctx->pos;
++    checkpoint.num_spaces = ctx->num_spaces;
++    return readstat_index_append(index, &checkpoint);
++}
++
++static readstat_error_t por_build_index(por_ctx_t *ctx, readstat_index_t *index) {
++    readstat_error_t retval = READSTAT_OK;
++
++    index->entry_size = sizeof(por_checkpoint_t);
++    ctx->index_only = 1;
++    ctx->row_offset = 0;
++    ctx->row_limit = -1;
++    ctx->obs_count = 0;
++    ctx->data_finished = 0;
++
++    if ((retval = por_add_checkpoint(ctx, index, 0)) != READSTAT_OK)
++        return retval;
++
++    while (!ctx->data_finished) {
++        size_t rows = 0;
++
++        retval = por_read_rows(ctx, POR_INDEX_INTERVAL, &rows);
++        if (retval != READSTAT_OK)
++            return retval;
++        if (rows == 0)
++            break;
++
++        if (!ctx->data_finished) {
++            if ((retval = por_add_checkpoint(ctx, index, ctx->obs_count)) != READSTAT_OK)
++                return retval;
++        }
++    }
++
++    index->row_count = ctx->obs_count;
++    ctx->index_only = 0;
++    return READSTAT_OK;
++}
++
++static readstat_error_t por_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count) {
++    por_ctx_t *ctx = (por_ctx_t *)reader->ctx;
++    const por_checkpoint_t *checkpoints;
++    const por_checkpoint_t *checkpoint;
++    int64_t remaining;
++    int64_t row_limit;
++    size_t lo = 0, hi;
++
++    if (ctx == NULL || reader->index == NULL || reader->index->entry_size != sizeof(por_checkpoint_t) ||
++            reader->index->count == 0)
++        return READSTAT_ERROR_UNSUPPORTED_OPERATION;
++
++    if (start_row < 0)
++        start_row = 0;
++    if (start_row > reader->index->row_count)
++        start_row = reader->index->row_count;
++
++    remaining = reader->index->row_count - start_row;
++    row_limit = row_count < 0 || row_count > remaining ? remaining : row_count;
++    if (row_limit > INT_MAX)
++        row_limit = INT_MAX;
++
++    checkpoints = (const por_checkpoint_t *)reader->index->entries;
++    hi = reader->index->count;
++    while (lo < hi) {
++        size_t mid = lo + (hi - lo) / 2;
++        if (checkpoints[mid].first_row <= start_row)
++            lo = mid + 1;
++        else
++            hi = mid;
++    }
++    if (lo == 0)
++        return READSTAT_ERROR_PARSE;
++    checkpoint = &checkpoints[lo - 1];
++
++    if (ctx->io->seek(checkpoint->file_offset, READSTAT_SEEK_SET, ctx->io->io_ctx) == -1)
++        return READSTAT_ERROR_SEEK;
++
++    ctx->pos = checkpoint->pos;
++    ctx->num_spaces = checkpoint->num_spaces;
++    ctx->obs_count = 0;
++    ctx->row_offset = (int)(start_row - checkpoint->first_row);
++    ctx->row_limit = (int)row_limit;
++    ctx->data_finished = 0;
++    ctx->index_only = 0;
++
++    return READSTAT_OK;
++}
++
+ readstat_error_t read_version_and_timestamp(por_ctx_t *ctx) {
+     readstat_error_t retval = READSTAT_OK;
+     char string[256];
+@@ -744,15 +872,21 @@ cleanup:
      return retval;
  }
  
@@ -1332,7 +1955,7 @@ index 44dc0f4..bd1931c 100644
      ctx->handle = parser->handlers;
      ctx->user_ctx = user_ctx;
      ctx->io = io;
-@@ -770,7 +790,7 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
+@@ -770,7 +904,7 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
              goto cleanup;
          }
      }
@@ -1341,7 +1964,7 @@ index 44dc0f4..bd1931c 100644
      if (io->open(path, io->io_ctx) == -1) {
          retval = READSTAT_ERROR_OPEN;
          goto cleanup;
-@@ -785,7 +805,7 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
+@@ -785,7 +919,7 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
          retval = READSTAT_ERROR_SEEK;
          goto cleanup;
      }
@@ -1350,7 +1973,7 @@ index 44dc0f4..bd1931c 100644
      if (read_bytes(ctx, vanity, sizeof(vanity)) != sizeof(vanity)) {
          retval = READSTAT_ERROR_READ;
          goto cleanup;
-@@ -794,12 +814,12 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
+@@ -794,12 +928,12 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
      retval = readstat_convert(ctx->file_label, sizeof(ctx->file_label), vanity[1] + 20, 20, NULL);
      if (retval != READSTAT_OK)
          goto cleanup;
@@ -1365,7 +1988,7 @@ index 44dc0f4..bd1931c 100644
      ctx->space = reverse_lookup[126];
  
      int i;
-@@ -816,7 +836,7 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
+@@ -816,7 +950,7 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
  
      unsigned char check[8];
      char tr_check[8];
@@ -1374,7 +1997,7 @@ index 44dc0f4..bd1931c 100644
      if (read_bytes(ctx, check, sizeof(check)) != sizeof(check)) {
          retval = READSTAT_ERROR_READ;
          goto cleanup;
-@@ -837,9 +857,9 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
+@@ -837,9 +971,9 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
          retval = READSTAT_ERROR_PARSE;
          goto cleanup;
      }
@@ -1386,7 +2009,7 @@ index 44dc0f4..bd1931c 100644
      char string[256];
  
      retval = read_version_and_timestamp(ctx);
-@@ -897,21 +917,87 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
+@@ -897,21 +1031,117 @@ readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path,
                  if (retval != READSTAT_OK)
                      goto cleanup;
  
@@ -1403,23 +2026,24 @@ index 44dc0f4..bd1931c 100644
          if (retval != READSTAT_OK)
 -            break;
 +            goto cleanup;
-+    }
-+
+     }
+ 
 +data_ready:
 +    reader = readstat_reader_alloc(parser, READSTAT_FILE_FORMAT_POR, user_ctx);
 +    if (reader == NULL) {
 +        retval = READSTAT_ERROR_MALLOC;
 +        goto cleanup;
-     }
++    }
 +    reader->ctx = ctx;
 +    reader->read_rows = por_reader_read_rows;
++    reader->set_range = por_reader_set_range;
 +    reader->close = por_reader_close;
 +
 +    if (out_error)
 +        *out_error = READSTAT_OK;
 +
 +    return reader;
- 
++
  cleanup:
 -    io->close(io->io_ctx);
 -    por_ctx_free(ctx);
@@ -1464,6 +2088,35 @@ index 44dc0f4..bd1931c 100644
 +    reader->closed = 1;
 +}
 +
++readstat_index_t *readstat_por_index_build(readstat_parser_t *parser,
++        const char *path, void *user_ctx, readstat_error_t *out_error) {
++    readstat_error_t error = READSTAT_OK;
++    readstat_index_t *index = NULL;
++    readstat_reader_t *reader = readstat_por_reader_open(parser, path, user_ctx, &error);
++
++    if (reader == NULL)
++        goto cleanup;
++
++    index = readstat_index_alloc(READSTAT_FILE_FORMAT_POR);
++    if (index == NULL) {
++        error = READSTAT_ERROR_MALLOC;
++        goto cleanup;
++    }
++
++    error = por_build_index((por_ctx_t *)reader->ctx, index);
++
++cleanup:
++    if (reader)
++        readstat_reader_close(reader);
++    if (error != READSTAT_OK) {
++        readstat_index_free(index);
++        index = NULL;
++    }
++    if (out_error)
++        *out_error = error;
++    return index;
++}
++
 +readstat_error_t readstat_parse_por(readstat_parser_t *parser, const char *path, void *user_ctx) {
 +    readstat_error_t error = READSTAT_OK;
 +    readstat_reader_t *reader = readstat_por_reader_open(parser, path, user_ctx, &error);
@@ -1499,7 +2152,7 @@ index 62188bb..01c6338 100644
          iconv_close(ctx->converter);
      if (ctx->variable_display_values) {
 diff --git a/src/spss/readstat_sav.h b/src/spss/readstat_sav.h
-index e417ac4..0d00a9a 100644
+index e417ac4..8f881e6 100644
 --- a/src/spss/readstat_sav.h
 +++ b/src/spss/readstat_sav.h
 @@ -93,6 +93,7 @@ typedef struct sav_ctx_s {
@@ -1510,7 +2163,7 @@ index e417ac4..0d00a9a 100644
  
      char          *utf8_string;
      size_t         utf8_string_len;
-@@ -110,6 +111,13 @@ typedef struct sav_ctx_s {
+@@ -110,6 +111,15 @@ typedef struct sav_ctx_s {
      readstat_compress_t  compression;
      readstat_endian_t   endianness;
      unsigned int   bswap:1;
@@ -1519,12 +2172,14 @@ index e417ac4..0d00a9a 100644
 +    void         (*data_state_free)(void *);
 +    int            data_started;
 +    int            data_finished;
++    int            index_only;
++    int64_t        data_section_offset;
 +    unsigned char *data_buffer;
 +    size_t         data_buffer_len;
  } sav_ctx_t;
  
  #define SAV_RECORD_TYPE_VARIABLE                2
-@@ -142,5 +150,7 @@ typedef struct sav_ctx_s {
+@@ -142,5 +152,7 @@ typedef struct sav_ctx_s {
  
  #define SAV_EIGHT_SPACES              "        "
  
@@ -1533,7 +2188,7 @@ index e417ac4..0d00a9a 100644
  sav_ctx_t *sav_ctx_init(sav_file_header_record_t *header, readstat_io_t *io);
  void sav_ctx_free(sav_ctx_t *ctx);
 diff --git a/src/spss/readstat_sav_read.c b/src/spss/readstat_sav_read.c
-index 7cd7452..96f09fa 100644
+index 7cd7452..10b1c4e 100644
 --- a/src/spss/readstat_sav_read.c
 +++ b/src/spss/readstat_sav_read.c
 @@ -14,6 +14,7 @@
@@ -1544,16 +2199,19 @@ index 7cd7452..96f09fa 100644
  #include "../CKHashTable.h"
  
  #include "readstat_sav.h"
-@@ -124,6 +125,8 @@ typedef struct value_label_s {
+@@ -124,6 +125,11 @@ typedef struct value_label_s {
  } value_label_t;
  
  static readstat_error_t sav_update_progress(sav_ctx_t *ctx);
 +static readstat_error_t sav_reader_read_rows(readstat_reader_t *reader, size_t max_rows);
++static readstat_error_t sav_read_rows(sav_ctx_t *ctx, size_t max_rows, size_t *out_rows);
++static readstat_error_t sav_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count);
 +static void sav_reader_close(readstat_reader_t *reader);
  static readstat_error_t sav_read_data(sav_ctx_t *ctx);
  static readstat_error_t sav_read_compressed_data(sav_ctx_t *ctx,
          readstat_error_t (*row_handler)(unsigned char *, size_t, sav_ctx_t *));
-@@ -190,6 +193,8 @@ static void sav_tag_missing_double(readstat_value_t *value, sav_ctx_t *ctx) {
+@@ -190,6 +196,8 @@ static void sav_tag_missing_double(readstat_value_t *value, sav_ctx_t *ctx) {
  
  static readstat_error_t sav_update_progress(sav_ctx_t *ctx) {
      readstat_io_t *io = ctx->io;
@@ -1562,7 +2220,7 @@ index 7cd7452..96f09fa 100644
      return io->update(ctx->file_size, ctx->handle.progress, ctx->user_ctx, io->io_ctx);
  }
  
-@@ -707,7 +712,7 @@ static readstat_error_t sav_read_dictionary_termination_record(sav_ctx_t *ctx) {
+@@ -707,7 +715,7 @@ static readstat_error_t sav_read_dictionary_termination_record(sav_ctx_t *ctx) {
      return retval;
  }
  
@@ -1571,7 +2229,7 @@ index 7cd7452..96f09fa 100644
      if (ctx->row_offset) {
          ctx->row_offset--;
          return READSTAT_OK;
-@@ -720,7 +725,6 @@ static readstat_error_t sav_process_row(unsigned char *buffer, size_t buffer_len
+@@ -720,7 +728,6 @@ static readstat_error_t sav_process_row(unsigned char *buffer, size_t buffer_len
      size_t raw_str_used = 0;
      int segment_offset = 0;
      int var_index = 0, col = 0;
@@ -1579,7 +2237,7 @@ index 7cd7452..96f09fa 100644
  
      while (data_offset < buffer_len && col < ctx->var_index && var_index < ctx->var_index) {
          spss_varinfo_t *col_info = ctx->varinfo[col];
-@@ -732,7 +736,7 @@ static readstat_error_t sav_process_row(unsigned char *buffer, size_t buffer_len
+@@ -732,7 +739,7 @@ static readstat_error_t sav_process_row(unsigned char *buffer, size_t buffer_len
          }
          if (var_info->type == READSTAT_TYPE_STRING) {
              if (raw_str_used + 8 <= ctx->raw_string_len) {
@@ -1588,7 +2246,7 @@ index 7cd7452..96f09fa 100644
                      /* Skip null bytes, see https://github.com/tidyverse/haven/issues/560  */
                      char c;
                      for (int i=0; i<8; i++)
-@@ -795,11 +799,43 @@ done:
+@@ -795,11 +802,163 @@ done:
      return retval;
  }
  
@@ -1614,6 +2272,122 @@ index 7cd7452..96f09fa 100644
 +    free(state);
 +}
 +
++#define SAV_RLE_INDEX_INTERVAL 2048
++
++typedef struct sav_rle_checkpoint_s {
++    int64_t      first_row;
++    int64_t      file_offset;
++    unsigned char chunk[8];
++    unsigned char chunk_pos;
++} sav_rle_checkpoint_t;
++
++static readstat_error_t sav_rle_add_checkpoint(sav_ctx_t *ctx,
++        sav_rle_state_t *state, readstat_index_t *index, int64_t row) {
++    sav_rle_checkpoint_t checkpoint;
++    readstat_off_t file_pos = ctx->io->seek(0, READSTAT_SEEK_CUR, ctx->io->io_ctx);
++
++    if (file_pos == -1)
++        return READSTAT_ERROR_SEEK;
++
++    checkpoint.first_row = row;
++    checkpoint.file_offset = file_pos - (int64_t)(state->buffer_used - state->data_offset);
++    memcpy(checkpoint.chunk, state->stream.chunk, sizeof(checkpoint.chunk));
++    checkpoint.chunk_pos = (unsigned char)state->stream.i;
++
++    return readstat_index_append(index, &checkpoint);
++}
++
++static readstat_error_t sav_rle_build_index(sav_ctx_t *ctx, readstat_index_t *index) {
++    sav_rle_state_t *state = (sav_rle_state_t *)ctx->data_state;
++    readstat_error_t retval = READSTAT_OK;
++
++    if (state == NULL)
++        return READSTAT_ERROR_PARSE;
++
++    index->entry_size = sizeof(sav_rle_checkpoint_t);
++    ctx->index_only = 1;
++    ctx->row_offset = 0;
++    ctx->current_row = 0;
++    ctx->row_limit = -1;
++    ctx->data_finished = 0;
++
++    if ((retval = sav_rle_add_checkpoint(ctx, state, index, 0)) != READSTAT_OK)
++        return retval;
++
++    while (!ctx->data_finished) {
++        size_t rows = 0;
++
++        retval = sav_read_rows(ctx, SAV_RLE_INDEX_INTERVAL, &rows);
++        if (retval != READSTAT_OK)
++            return retval;
++        if (rows == 0)
++            break;
++
++        if (!ctx->data_finished) {
++            if ((retval = sav_rle_add_checkpoint(ctx, state, index, ctx->current_row)) != READSTAT_OK)
++                return retval;
++        }
++    }
++
++    index->row_count = ctx->current_row;
++    return READSTAT_OK;
++}
++
++static readstat_error_t sav_rle_set_range(sav_ctx_t *ctx, int64_t start_row,
++        int64_t row_count, const readstat_index_t *index) {
++    const sav_rle_checkpoint_t *checkpoints;
++    const sav_rle_checkpoint_t *checkpoint;
++    sav_rle_state_t *state = (sav_rle_state_t *)ctx->data_state;
++    int64_t remaining;
++    int64_t row_limit;
++    size_t lo = 0, hi;
++
++    if (state == NULL || index == NULL || index->entry_size != sizeof(sav_rle_checkpoint_t) || index->count == 0)
++        return READSTAT_ERROR_UNSUPPORTED_OPERATION;
++
++    if (start_row < 0)
++        start_row = 0;
++    if (start_row > index->row_count)
++        start_row = index->row_count;
++
++    remaining = index->row_count - start_row;
++    row_limit = row_count < 0 || row_count > remaining ? remaining : row_count;
++    if (row_limit > INT_MAX)
++        row_limit = INT_MAX;
++
++    checkpoints = (const sav_rle_checkpoint_t *)index->entries;
++    hi = index->count;
++    while (lo < hi) {
++        size_t mid = lo + (hi - lo) / 2;
++        if (checkpoints[mid].first_row <= start_row)
++            lo = mid + 1;
++        else
++            hi = mid;
++    }
++    if (lo == 0)
++        return READSTAT_ERROR_PARSE;
++    checkpoint = &checkpoints[lo - 1];
++
++    if (ctx->io->seek(checkpoint->file_offset, READSTAT_SEEK_SET, ctx->io->io_ctx) == -1)
++        return READSTAT_ERROR_SEEK;
++
++    state->buffer_used = 0;
++    state->data_offset = 0;
++    state->uncompressed_offset = 0;
++    state->finished = 0;
++    state->stream.status = SAV_ROW_STREAM_HAVE_DATA;
++    state->stream.i = checkpoint->chunk_pos;
++    memcpy(state->stream.chunk, checkpoint->chunk, sizeof(checkpoint->chunk));
++
++    ctx->index_only = 0;
++    ctx->row_offset = (int)(start_row - checkpoint->first_row);
++    ctx->current_row = 0;
++    ctx->row_limit = (int)row_limit;
++    ctx->data_finished = 0;
++
++    return READSTAT_OK;
++}
++
 +static readstat_error_t sav_prepare_data(sav_ctx_t *ctx) {
      readstat_error_t retval = READSTAT_OK;
 +    readstat_io_t *io = ctx->io;
@@ -1622,6 +2396,10 @@ index 7cd7452..96f09fa 100644
  
 +    if (ctx->data_started)
 +        return READSTAT_OK;
++
++    ctx->data_section_offset = io->seek(0, READSTAT_SEEK_CUR, io->io_ctx);
++    if (ctx->data_section_offset == -1)
++        return READSTAT_ERROR_SEEK;
 +
 +    ctx->data_started = 1;
 +
@@ -1633,7 +2411,7 @@ index 7cd7452..96f09fa 100644
      for (i=0; i<ctx->var_index;) {
          spss_varinfo_t *info = ctx->varinfo[i];
          if (info->string_length > longest_string) {
-@@ -808,6 +844,7 @@ static readstat_error_t sav_read_data(sav_ctx_t *ctx) {
+@@ -808,6 +967,7 @@ static readstat_error_t sav_read_data(sav_ctx_t *ctx) {
          i += info->n_segments;
      }
  
@@ -1641,7 +2419,7 @@ index 7cd7452..96f09fa 100644
      ctx->raw_string_len = longest_string + sizeof(SAV_EIGHT_SPACES)-2;
      ctx->raw_string = readstat_malloc(ctx->raw_string_len);
  
-@@ -816,136 +853,182 @@ static readstat_error_t sav_read_data(sav_ctx_t *ctx) {
+@@ -816,136 +976,186 @@ static readstat_error_t sav_read_data(sav_ctx_t *ctx) {
  
      if (ctx->raw_string == NULL || ctx->utf8_string == NULL) {
          retval = READSTAT_ERROR_MALLOC;
@@ -1774,18 +2552,18 @@ index 7cd7452..96f09fa 100644
 -    readstat_off_t data_offset = 0;
 -    unsigned char buffer[DATA_BUFFER_SIZE];
 -    int buffer_used = 0;
-+    sav_rle_state_t *state = (sav_rle_state_t *)ctx->data_state;
- 
+-
 -    size_t uncompressed_row_len = ctx->var_offset * 8;
 -    readstat_off_t uncompressed_offset = 0;
 -    unsigned char *uncompressed_row = NULL;
-+    *out_rows = 0;
++    sav_rle_state_t *state = (sav_rle_state_t *)ctx->data_state;
  
 -    struct sav_row_stream_s state = { 
 -        .missing_value = ctx->missing_double,
 -        .bias = ctx->bias,
 -        .bswap = ctx->bswap };
--
++    *out_rows = 0;
+ 
 -    if (uncompressed_row_len && (uncompressed_row = readstat_malloc(uncompressed_row_len)) == NULL) {
 -        retval = READSTAT_ERROR_MALLOC;
 -        goto done;
@@ -1840,15 +2618,21 @@ index 7cd7452..96f09fa 100644
  
 -            if (state.status == SAV_ROW_STREAM_FINISHED_ROW) {
 -                retval = row_handler(uncompressed_row, uncompressed_row_len, ctx);
+-                if (retval != READSTAT_OK)
+-                    goto done;
 +            if (state->stream.status == SAV_ROW_STREAM_FINISHED_ROW) {
-+                retval = sav_process_row(state->uncompressed_row, state->uncompressed_row_len, ctx);
-                 if (retval != READSTAT_OK)
-                     goto done;
- 
--                uncompressed_offset = 0;
++                if (ctx->index_only) {
++                    ctx->current_row++;
++                } else {
++                    retval = sav_process_row(state->uncompressed_row, state->uncompressed_row_len, ctx);
++                    if (retval != READSTAT_OK)
++                        goto done;
++                }
++
 +                state->uncompressed_offset = 0;
 +                (*out_rows)++;
-+
+ 
+-                uncompressed_offset = 0;
 +                if (ctx->row_limit >= 0 && ctx->current_row >= ctx->row_limit) {
 +                    state->finished = 1;
 +                    break;
@@ -1893,7 +2677,7 @@ index 7cd7452..96f09fa 100644
  static readstat_error_t sav_parse_machine_integer_info_record(const void *data, size_t data_len, sav_ctx_t *ctx) {
      if (data_len != 32)
          return READSTAT_ERROR_PARSE;
-@@ -1607,15 +1690,18 @@ cleanup:
+@@ -1607,15 +1817,18 @@ cleanup:
      return retval;
  }
  
@@ -1915,7 +2699,7 @@ index 7cd7452..96f09fa 100644
      }
  
      file_size = io->seek(0, READSTAT_SEEK_END, io->io_ctx);
-@@ -1654,18 +1740,18 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
+@@ -1654,18 +1867,18 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
              ctx->row_offset = ctx->record_count;
          }
          ctx->row_limit = record_count_after_skipping;
@@ -1937,7 +2721,7 @@ index 7cd7452..96f09fa 100644
      if (io->seek(sizeof(sav_file_header_record_t), READSTAT_SEEK_SET, io->io_ctx) == -1) {
          retval = READSTAT_ERROR_SEEK;
          goto cleanup;
-@@ -1676,7 +1762,7 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
+@@ -1676,7 +1889,7 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
  
      if ((retval = sav_parse_records_pass2(ctx)) != READSTAT_OK)
          goto cleanup;
@@ -1946,7 +2730,7 @@ index 7cd7452..96f09fa 100644
      if ((retval = sav_set_n_segments_and_var_count(ctx)) != READSTAT_OK)
          goto cleanup;
  
-@@ -1725,17 +1811,13 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
+@@ -1725,17 +1938,13 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
                  spss_varinfo_t *info = (spss_varinfo_t *)ck_str_hash_lookup(sv_name_upper, var_dict);
                  if (info) {
                      free(mr.subvariables[j]);
@@ -1964,7 +2748,7 @@ index 7cd7452..96f09fa 100644
              }
          }
          if (var_dict)
-@@ -1756,18 +1838,82 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
+@@ -1756,18 +1965,184 @@ readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path,
      if ((retval = sav_handle_variables(ctx)) != READSTAT_OK)
          goto cleanup;
  
@@ -1985,6 +2769,7 @@ index 7cd7452..96f09fa 100644
 -    
 +    reader->ctx = ctx;
 +    reader->read_rows = sav_reader_read_rows;
++    reader->set_range = sav_reader_set_range;
 +    reader->close = sav_reader_close;
 +
 +    if (out_error)
@@ -2023,6 +2808,54 @@ index 7cd7452..96f09fa 100644
 +    return READSTAT_OK;
 +}
 +
++static readstat_error_t sav_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count) {
++    sav_ctx_t *ctx = (sav_ctx_t *)reader->ctx;
++    int64_t remaining;
++    int64_t row_limit;
++    int64_t data_offset;
++
++    if (ctx == NULL || !ctx->data_started)
++        return READSTAT_ERROR_PARSE;
++
++    if (ctx->compression == READSTAT_COMPRESS_ROWS)
++        return sav_rle_set_range(ctx, start_row, row_count, reader->index);
++    if (ctx->compression == READSTAT_COMPRESS_BINARY) {
++#if HAVE_ZLIB
++        return zsav_set_range(ctx, start_row, row_count, reader->index);
++#else
++        return READSTAT_ERROR_UNSUPPORTED_OPERATION;
++#endif
++    }
++    if (ctx->compression != READSTAT_COMPRESS_NONE)
++        return READSTAT_ERROR_UNSUPPORTED_OPERATION;
++
++    if (start_row < 0)
++        start_row = 0;
++    if (ctx->record_count >= 0 && start_row > ctx->record_count)
++        start_row = ctx->record_count;
++
++    if (ctx->record_count >= 0) {
++        remaining = ctx->record_count - start_row;
++        row_limit = row_count < 0 || row_count > remaining ? remaining : row_count;
++    } else {
++        row_limit = row_count;
++    }
++    if (row_limit > INT_MAX)
++        row_limit = INT_MAX;
++
++    data_offset = ctx->data_section_offset + (int64_t)ctx->data_buffer_len * start_row;
++    if (ctx->io->seek(data_offset, READSTAT_SEEK_SET, ctx->io->io_ctx) == -1)
++        return READSTAT_ERROR_SEEK;
++
++    ctx->row_offset = 0;
++    ctx->current_row = 0;
++    ctx->row_limit = (int)row_limit;
++    ctx->data_finished = 0;
++
++    return READSTAT_OK;
++}
++
 +static void sav_reader_close(readstat_reader_t *reader) {
 +    sav_ctx_t *ctx = (sav_ctx_t *)reader->ctx;
 +
@@ -2034,6 +2867,59 @@ index 7cd7452..96f09fa 100644
 +    }
 +
 +    reader->closed = 1;
++}
++
++static int sav_index_value_handler(int obs_index, readstat_variable_t *variable,
++        readstat_value_t value, void *ctx) {
++    (void)obs_index;
++    (void)variable;
++    (void)value;
++    (void)ctx;
++    return READSTAT_HANDLER_OK;
++}
++
++readstat_index_t *readstat_sav_index_build(readstat_parser_t *parser,
++        const char *path, void *user_ctx, readstat_error_t *out_error) {
++    readstat_value_handler old_value_handler = parser->handlers.value;
++    readstat_error_t error = READSTAT_OK;
++    readstat_index_t *index = NULL;
++    readstat_reader_t *reader = NULL;
++    sav_ctx_t *ctx;
++
++    parser->handlers.value = sav_index_value_handler;
++    reader = readstat_sav_reader_open(parser, path, user_ctx, &error);
++    parser->handlers.value = old_value_handler;
++
++    if (reader == NULL)
++        goto cleanup;
++
++    ctx = (sav_ctx_t *)reader->ctx;
++    index = readstat_index_alloc(READSTAT_FILE_FORMAT_SAV);
++    if (index == NULL) {
++        error = READSTAT_ERROR_MALLOC;
++        goto cleanup;
++    }
++
++    if (ctx->compression == READSTAT_COMPRESS_ROWS) {
++        error = sav_rle_build_index(ctx, index);
++#if HAVE_ZLIB
++    } else if (ctx->compression == READSTAT_COMPRESS_BINARY) {
++        error = readstat_zsav_build_index(ctx, index);
++#endif
++    } else {
++        error = READSTAT_ERROR_UNSUPPORTED_OPERATION;
++    }
++
++cleanup:
++    if (reader)
++        readstat_reader_close(reader);
++    if (error != READSTAT_OK) {
++        readstat_index_free(index);
++        index = NULL;
++    }
++    if (out_error)
++        *out_error = error;
++    return index;
 +}
 +
 +readstat_error_t readstat_parse_sav(readstat_parser_t *parser, const char *path, void *user_ctx) {
@@ -2056,10 +2942,18 @@ index 7cd7452..96f09fa 100644
 +    return READSTAT_OK;
  }
 diff --git a/src/spss/readstat_zsav_read.c b/src/spss/readstat_zsav_read.c
-index f7dc91b..8556a86 100644
+index f7dc91b..a5fba42 100644
 --- a/src/spss/readstat_zsav_read.c
 +++ b/src/spss/readstat_zsav_read.c
-@@ -28,81 +28,95 @@ struct ztrailer_entry {
+@@ -5,6 +5,7 @@
+ #include "../readstat_bits.h"
+ #include "../readstat_iconv.h"
+ #include "../readstat_malloc.h"
++#include "../readstat_reader.h"
+ #include "readstat_sav.h"
+ #include "readstat_sav_compress.h"
+ 
+@@ -28,81 +29,96 @@ struct ztrailer_entry {
      int32_t compressed_size;
  };
  
@@ -2098,6 +2992,7 @@ index f7dc91b..8556a86 100644
 +    unsigned char *uncompressed_row;
 +    size_t         uncompressed_row_len;
 +    size_t         uncompressed_offset;
++    size_t         resume_offset;
 +    struct sav_row_stream_s stream;
 +    int            finished;
 +} zsav_state_t;
@@ -2194,7 +3089,7 @@ index f7dc91b..8556a86 100644
  
          entry->uncompressed_ofs = ctx->bswap ? byteswap8(entry->uncompressed_ofs) : entry->uncompressed_ofs;
          entry->compressed_ofs = ctx->bswap ? byteswap8(entry->compressed_ofs) : entry->compressed_ofs;
-@@ -110,81 +124,127 @@ readstat_error_t zsav_read_compressed_data(sav_ctx_t *ctx,
+@@ -110,81 +126,254 @@ readstat_error_t zsav_read_compressed_data(sav_ctx_t *ctx,
          entry->compressed_size = ctx->bswap ? byteswap4(entry->compressed_size) : entry->compressed_size;
      }
  
@@ -2245,13 +3140,146 @@ index f7dc91b..8556a86 100644
 +    return retval;
 +}
 +
++readstat_error_t zsav_read_rows(sav_ctx_t *ctx, size_t max_rows, size_t *out_rows);
++
++#define ZSAV_INDEX_INTERVAL 2048
++
++typedef struct zsav_checkpoint_s {
++    int64_t      first_row;
++    int          block_index;
++    int          block_loaded;
++    size_t       block_data_offset;
++    unsigned char chunk[8];
++    unsigned char chunk_pos;
++} zsav_checkpoint_t;
++
++static readstat_error_t zsav_add_checkpoint(sav_ctx_t *ctx, zsav_state_t *state,
++        readstat_index_t *index, int64_t row) {
++    zsav_checkpoint_t checkpoint;
++
++    memset(&checkpoint, 0, sizeof(checkpoint));
++    checkpoint.first_row = row;
++    if (state->block_loaded) {
++        checkpoint.block_index = state->block_i - 1;
++        checkpoint.block_loaded = 1;
++        checkpoint.block_data_offset = state->data_offset;
++    } else {
++        checkpoint.block_index = state->block_i;
++    }
++    memcpy(checkpoint.chunk, state->stream.chunk, sizeof(checkpoint.chunk));
++    checkpoint.chunk_pos = (unsigned char)state->stream.i;
++
++    return readstat_index_append(index, &checkpoint);
++}
++
++readstat_error_t readstat_zsav_build_index(sav_ctx_t *ctx, readstat_index_t *index) {
++    zsav_state_t *state = (zsav_state_t *)ctx->data_state;
++    readstat_error_t retval = READSTAT_OK;
++
++    if (state == NULL)
++        return READSTAT_ERROR_PARSE;
++
++    index->entry_size = sizeof(zsav_checkpoint_t);
++    ctx->index_only = 1;
++    ctx->row_offset = 0;
++    ctx->current_row = 0;
++    ctx->row_limit = -1;
++    ctx->data_finished = 0;
++
++    if ((retval = zsav_add_checkpoint(ctx, state, index, 0)) != READSTAT_OK)
++        return retval;
++
++    while (!ctx->data_finished) {
++        size_t rows = 0;
++
++        retval = zsav_read_rows(ctx, ZSAV_INDEX_INTERVAL, &rows);
++        if (retval != READSTAT_OK)
++            return retval;
++        if (rows == 0)
++            break;
++
++        if (!ctx->data_finished) {
++            if ((retval = zsav_add_checkpoint(ctx, state, index, ctx->current_row)) != READSTAT_OK)
++                return retval;
+         }
++    }
+ 
+-        block_i++;
+-        state.status = SAV_ROW_STREAM_HAVE_DATA;
+-        data_offset = 0;
++    index->row_count = ctx->current_row;
++    return READSTAT_OK;
++}
+ 
+-        while (state.status != SAV_ROW_STREAM_NEED_DATA) {
+-            state.next_in = &uncompressed_block[data_offset];
+-            state.avail_in = uncompressed_block_len - data_offset;
++readstat_error_t zsav_set_range(sav_ctx_t *ctx, int64_t start_row,
++        int64_t row_count, const readstat_index_t *index) {
++    const zsav_checkpoint_t *checkpoints;
++    const zsav_checkpoint_t *checkpoint;
++    zsav_state_t *state = (zsav_state_t *)ctx->data_state;
++    int64_t remaining;
++    int64_t row_limit;
++    size_t lo = 0, hi;
++
++    if (state == NULL || index == NULL || index->entry_size != sizeof(zsav_checkpoint_t) || index->count == 0)
++        return READSTAT_ERROR_UNSUPPORTED_OPERATION;
++
++    if (start_row < 0)
++        start_row = 0;
++    if (start_row > index->row_count)
++        start_row = index->row_count;
++
++    remaining = index->row_count - start_row;
++    row_limit = row_count < 0 || row_count > remaining ? remaining : row_count;
++    if (row_limit > INT_MAX)
++        row_limit = INT_MAX;
++
++    checkpoints = (const zsav_checkpoint_t *)index->entries;
++    hi = index->count;
++    while (lo < hi) {
++        size_t mid = lo + (hi - lo) / 2;
++        if (checkpoints[mid].first_row <= start_row)
++            lo = mid + 1;
++        else
++            hi = mid;
++    }
++    if (lo == 0)
++        return READSTAT_ERROR_PARSE;
++    checkpoint = &checkpoints[lo - 1];
++
++    state->block_i = checkpoint->block_index;
++    state->block_loaded = 0;
++    state->resume_offset = checkpoint->block_loaded ? checkpoint->block_data_offset : 0;
++    state->data_offset = 0;
++    state->uncompressed_offset = 0;
++    state->finished = 0;
++    state->stream.status = SAV_ROW_STREAM_HAVE_DATA;
++    state->stream.i = checkpoint->chunk_pos;
++    memcpy(state->stream.chunk, checkpoint->chunk, sizeof(checkpoint->chunk));
++
++    ctx->index_only = 0;
++    ctx->row_offset = (int)(start_row - checkpoint->first_row);
++    ctx->current_row = 0;
++    ctx->row_limit = (int)row_limit;
++    ctx->data_finished = 0;
++
++    return READSTAT_OK;
++}
+ 
+-            state.next_out = &uncompressed_row[uncompressed_offset];
+-            state.avail_out = uncompressed_row_len - uncompressed_offset;
 +readstat_error_t zsav_read_rows(sav_ctx_t *ctx, size_t max_rows, size_t *out_rows) {
 +    readstat_error_t retval = READSTAT_OK;
 +    readstat_io_t *io = ctx->io;
 +    zsav_state_t *state = (zsav_state_t *)ctx->data_state;
-+
+ 
+-            sav_decompress_row(&state);
 +    *out_rows = 0;
-+
+ 
+-            uncompressed_offset = uncompressed_row_len - state.avail_out;
+-            data_offset = uncompressed_block_len - state.avail_in;
 +    if (state == NULL) {
 +        ctx->data_finished = 1;
 +        return READSTAT_OK;
@@ -2285,7 +3313,9 @@ index f7dc91b..8556a86 100644
 +                retval = READSTAT_ERROR_READ;
 +                goto done;
 +            }
-+
+ 
+-            if (state.status == SAV_ROW_STREAM_FINISHED_ROW) {
+-                retval = row_handler(uncompressed_row, uncompressed_row_len, ctx);
 +            if (state->uncompressed_block_capacity < (size_t)entry->uncompressed_size) {
 +                unsigned char *uncompressed_block = readstat_realloc(state->uncompressed_block, entry->uncompressed_size);
 +                if (uncompressed_block == NULL) {
@@ -2304,42 +3334,33 @@ index f7dc91b..8556a86 100644
 +            }
 +
 +            state->block_i++;
-+            state->data_offset = 0;
++            state->data_offset = state->resume_offset;
++            state->resume_offset = 0;
 +            state->stream.status = SAV_ROW_STREAM_HAVE_DATA;
 +            state->block_loaded = 1;
-         }
- 
--        block_i++;
--        state.status = SAV_ROW_STREAM_HAVE_DATA;
--        data_offset = 0;
++        }
++
 +        state->stream.next_in = &state->uncompressed_block[state->data_offset];
 +        state->stream.avail_in = state->uncompressed_block_len - state->data_offset;
- 
--        while (state.status != SAV_ROW_STREAM_NEED_DATA) {
--            state.next_in = &uncompressed_block[data_offset];
--            state.avail_in = uncompressed_block_len - data_offset;
++
 +        state->stream.next_out = &state->uncompressed_row[state->uncompressed_offset];
 +        state->stream.avail_out = state->uncompressed_row_len - state->uncompressed_offset;
- 
--            state.next_out = &uncompressed_row[uncompressed_offset];
--            state.avail_out = uncompressed_row_len - uncompressed_offset;
++
 +        sav_decompress_row(&state->stream);
- 
--            sav_decompress_row(&state);
++
 +        state->uncompressed_offset = state->uncompressed_row_len - state->stream.avail_out;
 +        state->data_offset = state->uncompressed_block_len - state->stream.avail_in;
- 
--            uncompressed_offset = uncompressed_row_len - state.avail_out;
--            data_offset = uncompressed_block_len - state.avail_in;
++
 +        if (state->stream.status == SAV_ROW_STREAM_FINISHED_ROW) {
-+            retval = sav_process_row(state->uncompressed_row, state->uncompressed_row_len, ctx);
-+            if (retval != READSTAT_OK)
-+                goto done;
- 
--            if (state.status == SAV_ROW_STREAM_FINISHED_ROW) {
--                retval = row_handler(uncompressed_row, uncompressed_row_len, ctx);
--                if (retval != READSTAT_OK)
++            if (ctx->index_only) {
++                ctx->current_row++;
++            } else {
++                retval = sav_process_row(state->uncompressed_row, state->uncompressed_row_len, ctx);
+                 if (retval != READSTAT_OK)
 -                    goto cleanup;
++                    goto done;
++            }
++
 +            state->uncompressed_offset = 0;
 +            (*out_rows)++;
  
@@ -2379,15 +3400,21 @@ index f7dc91b..8556a86 100644
      return retval;
  }
 diff --git a/src/spss/readstat_zsav_read.h b/src/spss/readstat_zsav_read.h
-index 115333e..c1a82f1 100644
+index 115333e..0b6dc05 100644
 --- a/src/spss/readstat_zsav_read.h
 +++ b/src/spss/readstat_zsav_read.h
-@@ -1,3 +1,3 @@
+@@ -1,3 +1,9 @@
++#include "../readstat.h"
  
 -readstat_error_t zsav_read_compressed_data(sav_ctx_t *ctx,
 -        readstat_error_t (*row_handler)(unsigned char *, size_t, sav_ctx_t *));
++
 +readstat_error_t zsav_data_state_init(sav_ctx_t *ctx);
 +readstat_error_t zsav_read_rows(sav_ctx_t *ctx, size_t max_rows, size_t *out_rows);
++
++readstat_error_t readstat_zsav_build_index(sav_ctx_t *ctx, readstat_index_t *index);
++readstat_error_t zsav_set_range(sav_ctx_t *ctx, int64_t start_row,
++        int64_t row_count, const readstat_index_t *index);
 diff --git a/src/stata/readstat_dta.c b/src/stata/readstat_dta.c
 index d798c5c..8aaaf63 100644
 --- a/src/stata/readstat_dta.c
@@ -2402,10 +3429,18 @@ index d798c5c..8aaaf63 100644
          iconv_close(ctx->converter);
      if (ctx->data_label)
 diff --git a/src/stata/readstat_dta.h b/src/stata/readstat_dta.h
-index 486cd31..7d533b5 100644
+index 486cd31..22d2792 100644
 --- a/src/stata/readstat_dta.h
 +++ b/src/stata/readstat_dta.h
-@@ -94,6 +94,8 @@ typedef struct dta_ctx_s {
+@@ -87,6 +87,7 @@ typedef struct dta_ctx_s {
+     size_t         strl_o_len;
+ 
+     int64_t        data_offset;
++    int64_t        data_rows_offset;
+     int64_t        strls_offset;
+     int64_t        value_labels_offset;
+ 
+@@ -94,6 +95,8 @@ typedef struct dta_ctx_s {
      int            nvar;
      int64_t        nobs;
      size_t         record_len;
@@ -2414,7 +3449,7 @@ index 486cd31..7d533b5 100644
      int64_t        row_limit;
      int64_t        row_offset;
      int64_t        current_row;
-@@ -122,6 +124,8 @@ typedef struct dta_ctx_s {
+@@ -122,6 +125,8 @@ typedef struct dta_ctx_s {
      void                *user_ctx;
      readstat_io_t       *io;
      int                  initialized;
@@ -2424,7 +3459,7 @@ index 486cd31..7d533b5 100644
      char            error_buf[256];
  } dta_ctx_t;
 diff --git a/src/stata/readstat_dta_read.c b/src/stata/readstat_dta_read.c
-index ce07c33..f2a0322 100644
+index ce07c33..a5dd857 100644
 --- a/src/stata/readstat_dta_read.c
 +++ b/src/stata/readstat_dta_read.c
 @@ -14,6 +14,7 @@
@@ -2435,16 +3470,18 @@ index ce07c33..f2a0322 100644
  
  #include "readstat_dta.h"
  #include "readstat_dta_parse_timestamp.h"
-@@ -21,6 +22,8 @@
+@@ -21,6 +22,10 @@
  #define MAX_VALUE_LABEL_LEN 32000
  
  static readstat_error_t dta_update_progress(dta_ctx_t *ctx);
 +static readstat_error_t dta_reader_read_rows(readstat_reader_t *reader, size_t max_rows);
++static readstat_error_t dta_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count);
 +static void dta_reader_close(readstat_reader_t *reader);
  static readstat_error_t dta_read_descriptors(dta_ctx_t *ctx);
  static readstat_error_t dta_read_tag(dta_ctx_t *ctx, const char *tag);
  static readstat_error_t dta_read_expansion_fields(dta_ctx_t *ctx);
-@@ -653,55 +656,58 @@ cleanup:
+@@ -653,55 +658,58 @@ cleanup:
      return retval;
  }
  
@@ -2525,7 +3562,7 @@ index ce07c33..f2a0322 100644
          return READSTAT_OK;
      }
  
-@@ -711,24 +717,24 @@ static readstat_error_t dta_read_data(dta_ctx_t *ctx) {
+@@ -711,24 +719,28 @@ static readstat_error_t dta_read_data(dta_ctx_t *ctx) {
                      ctx->data_offset);
              ctx->handle.error(ctx->error_buf, ctx->user_ctx);
          }
@@ -2537,6 +3574,10 @@ index ce07c33..f2a0322 100644
      if ((retval = dta_read_tag(ctx, "<data>")) != READSTAT_OK)
 -        goto cleanup;
 +        return retval;
++
++    ctx->data_rows_offset = io->seek(0, READSTAT_SEEK_CUR, io->io_ctx);
++    if (ctx->data_rows_offset == -1)
++        return READSTAT_ERROR_SEEK;
  
      if ((retval = dta_update_progress(ctx)) != READSTAT_OK)
 -        goto cleanup;
@@ -2560,7 +3601,7 @@ index ce07c33..f2a0322 100644
  }
  
  static readstat_error_t dta_read_header(dta_ctx_t *ctx, dta_header_t *header) {
-@@ -1130,14 +1136,20 @@ cleanup:
+@@ -1130,14 +1142,20 @@ cleanup:
      return retval;
  }
  
@@ -2582,7 +3623,7 @@ index ce07c33..f2a0322 100644
  
      if (io->open(path, io->io_ctx) == -1) {
          retval = READSTAT_ERROR_OPEN;
-@@ -1205,7 +1217,7 @@ readstat_error_t readstat_parse_dta(readstat_parser_t *parser, const char *path,
+@@ -1205,7 +1223,7 @@ readstat_error_t readstat_parse_dta(readstat_parser_t *parser, const char *path,
      retval = dta_update_progress(ctx);
      if (retval != READSTAT_OK)
          goto cleanup;
@@ -2591,7 +3632,7 @@ index ce07c33..f2a0322 100644
      if ((retval = dta_read_label_and_timestamp(ctx)) != READSTAT_OK)
          goto cleanup;
  
-@@ -1270,16 +1282,82 @@ readstat_error_t readstat_parse_dta(readstat_parser_t *parser, const char *path,
+@@ -1270,16 +1288,113 @@ readstat_error_t readstat_parse_dta(readstat_parser_t *parser, const char *path,
      if ((retval = dta_read_strls(ctx)) != READSTAT_OK)
          goto cleanup;
  
@@ -2607,6 +3648,7 @@ index ce07c33..f2a0322 100644
 +    }
 +    reader->ctx = ctx;
 +    reader->read_rows = dta_reader_read_rows;
++    reader->set_range = dta_reader_set_range;
 +    reader->close = dta_reader_close;
 +
 +    if (out_error)
@@ -2636,6 +3678,36 @@ index ce07c33..f2a0322 100644
 +
 +    if (ctx->data_finished || rows == 0)
 +        reader->eof = 1;
++
++    return READSTAT_OK;
++}
++
++static readstat_error_t dta_reader_set_range(readstat_reader_t *reader,
++        int64_t start_row, int64_t row_count) {
++    dta_ctx_t *ctx = (dta_ctx_t *)reader->ctx;
++    int64_t remaining;
++    int64_t row_limit;
++    int64_t data_offset;
++
++    if (ctx == NULL || !ctx->data_started)
++        return READSTAT_ERROR_PARSE;
++
++    if (start_row < 0)
++        start_row = 0;
++    if (start_row > ctx->nobs)
++        start_row = ctx->nobs;
++
++    remaining = ctx->nobs - start_row;
++    row_limit = row_count < 0 || row_count > remaining ? remaining : row_count;
++
++    data_offset = ctx->data_rows_offset + (int64_t)ctx->record_len * start_row;
++    if (ctx->io->seek(data_offset, READSTAT_SEEK_SET, ctx->io->io_ctx) == -1)
++        return READSTAT_ERROR_SEEK;
++
++    ctx->row_offset = 0;
++    ctx->current_row = 0;
++    ctx->row_limit = row_limit;
++    ctx->data_finished = 0;
 +
 +    return READSTAT_OK;
 +}
