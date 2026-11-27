@@ -63,6 +63,9 @@ FROM 'portable_spss_data.por';
 FROM 'stata_data.dta';
 ```
 
+For the pull-reader architecture, the ReadStat patch, and notes on adding
+multithreaded reads, see [PULL_READER.md](PULL_READER.md).
+
 ## Contributing
 
 ### Cloning
@@ -107,6 +110,11 @@ a script is run to transform the shared library into a loadable extension by app
 to the `build/debug` directory.
 
 To create optimized release binaries, simply run `make release` instead.
+
+The normal build targets apply the additive ReadStat pull-reader patch in
+`patches/0001-readstat-pull-reader.patch` before compiling. The patch is applied
+to the checked-out submodule and is safe to run repeatedly. To restore the
+submodule to its pinned upstream revision, run `make unpatch_readstat`.
 
 #### Faster builds
 We recommend to install Ninja and Ccache for building as this can have a significant speed boost during development. After installing, ninja can be used 
