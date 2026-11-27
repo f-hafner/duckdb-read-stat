@@ -1,0 +1,80 @@
+# name: test/sql/chunks.test
+# description: read_stat keeps parser state across DuckDB chunks
+# group: [read_stat]
+
+require read_stat
+
+# All fixtures contain 4096 rows: id = 0..4095, val = id * 0.5.
+# 4096 rows is two full DuckDB chunks, so these queries cross a chunk boundary.
+
+query III
+SELECT count(*), sum(id), sum(val) FROM read_stat('./test/sql/chunks.sas7bdat');
+----
+4096	8386560.0	4193280.0
+
+query III
+SELECT count(*), sum(id), sum(val) FROM read_stat('./test/sql/chunks_rowcompress.sas7bdat');
+----
+4096	8386560.0	4193280.0
+
+query III
+SELECT count(*), sum(id), sum(val) FROM read_stat('./test/sql/chunks.xpt');
+----
+4096	8386560.0	4193280.0
+
+query III
+SELECT count(*), sum(id), sum(val) FROM read_stat('./test/sql/chunks.sav');
+----
+4096	8386560.0	4193280.0
+
+query III
+SELECT count(*), sum(id), sum(val) FROM read_stat('./test/sql/chunks_rowcompress.sav');
+----
+4096	8386560.0	4193280.0
+
+query III
+SELECT count(*), sum(id), sum(val) FROM read_stat('./test/sql/chunks.zsav');
+----
+4096	8386560.0	4193280.0
+
+query III
+SELECT count(*), sum(id), sum(val) FROM read_stat('./test/sql/chunks.por');
+----
+4096	8386560.0	4193280.0
+
+query III
+SELECT count(*), sum(id), sum(val) FROM read_stat('./test/sql/chunks.dta');
+----
+4096	8386560.0	4193280.0
+
+query II
+SELECT id, val FROM read_stat('./test/sql/chunks.sas7bdat')
+ORDER BY id LIMIT 3 OFFSET 2046;
+----
+2046.0	1023.0
+2047.0	1023.5
+2048.0	1024.0
+
+query II
+SELECT id, val FROM read_stat('./test/sql/chunks_rowcompress.sas7bdat')
+ORDER BY id LIMIT 3 OFFSET 2046;
+----
+2046.0	1023.0
+2047.0	1023.5
+2048.0	1024.0
+
+query II
+SELECT id, val FROM read_stat('./test/sql/chunks.sav')
+ORDER BY id LIMIT 3 OFFSET 2046;
+----
+2046.0	1023.0
+2047.0	1023.5
+2048.0	1024.0
+
+query II
+SELECT id, val FROM read_stat('./test/sql/chunks.por')
+ORDER BY id LIMIT 3 OFFSET 2046;
+----
+2046.0	1023.0
+2047.0	1023.5
+2048.0	1024.0
