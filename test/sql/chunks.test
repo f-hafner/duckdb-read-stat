@@ -78,3 +78,134 @@ ORDER BY id LIMIT 3 OFFSET 2046;
 2046.0	1023.0
 2047.0	1023.5
 2048.0	1024.0
+
+# Multithreaded scans split the file into contiguous row ranges. Each local
+# reader keeps its own ReadStat parser, format context, and DuckDB file handle
+# alive, and repositions to the next range without reopening the file.
+# DTA and uncompressed SAV use arithmetic row offsets. The remaining formats
+# use an immutable index built during bind when DuckDB has more than one thread.
+statement ok
+PRAGMA threads=4;
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.dta');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.sav');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks_rowcompress.sas7bdat');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.xpt');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.por');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.zsav');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks_rowcompress.sav');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.sas7bdat');
+----
+4096	4096	8386560.0	4193280.0
+
+# The parallel range boundary is at row 2048 (one vector per task).
+query II
+SELECT id, val FROM read_stat('./test/sql/chunks.dta') ORDER BY id LIMIT 3 OFFSET 2046;
+----
+2046.0	1023.0
+2047.0	1023.5
+2048.0	1024.0
+
+query II
+SELECT id, val FROM read_stat('./test/sql/chunks.sav') ORDER BY id LIMIT 3 OFFSET 2046;
+----
+2046.0	1023.0
+2047.0	1023.5
+2048.0	1024.0
+
+# The last task is short but must still return exactly the remaining rows.
+query II
+SELECT id, val FROM read_stat('./test/sql/chunks.dta') ORDER BY id LIMIT 4 OFFSET 4092;
+----
+4092.0	2046.0
+4093.0	2046.5
+4094.0	2047.0
+4095.0	2047.5
+
+query II
+SELECT id, val FROM read_stat('./test/sql/chunks.sav') ORDER BY id LIMIT 4 OFFSET 4092;
+----
+4092.0	2046.0
+4093.0	2046.5
+4094.0	2047.0
+4095.0	2047.5
+
+query III
+SELECT count(*), sum(id), sum(val) FROM read_stat('./test/sql/chunks.zsav');
+----
+4096	8386560.0	4193280.0
+
+query III
+SELECT count(*), sum(id), sum(val) FROM read_stat('./test/sql/chunks_rowcompress.sav');
+----
+4096	8386560.0	4193280.0
+
+statement ok
+PRAGMA threads=1;
+
+# With one execution thread, the same local reader must be repositioned across
+# both ranges instead of reopening the file.
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.dta');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.sav');
+----
+4096	4096	8386560.0	4193280.0
+
+# With threads=1 no index is built; every format must still take the serial path.
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks_rowcompress.sas7bdat');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.xpt');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.por');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks.zsav');
+----
+4096	4096	8386560.0	4193280.0
+
+query IIII
+SELECT count(*), count(DISTINCT id), sum(id), sum(val) FROM read_stat('./test/sql/chunks_rowcompress.sav');
+----
+4096	4096	8386560.0	4193280.0
