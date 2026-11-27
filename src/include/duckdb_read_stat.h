@@ -11,6 +11,7 @@ typedef enum duckdb_read_stat_file_format
 
 typedef enum duckdb_read_stat_datetime_format
 {
+    DATE_FORMAT_NONE = 0,
     DATE_FORMAT_DATE,
     DATE_FORMAT_DATETIME,
     DATE_FORMAT_TIME
@@ -19,6 +20,7 @@ typedef enum duckdb_read_stat_datetime_format
 typedef struct duckdb_read_stat_bind_data
 {
     duckdb_read_stat_file_format file_format;
+    readstat_file_format_t readstat_format;
     const char *format;
     const char *encoding;
     idx_t cardinality;
@@ -26,6 +28,11 @@ typedef struct duckdb_read_stat_bind_data
     char *error_message;
     duckdb_bind_info bind_info;
     duckdb_file_handle file_handle;
+
+    /* Per-column metadata that is invariant across chunks. */
+    duckdb_read_stat_datetime_format *column_date_formats;
+    uint8_t *column_has_defined_missing;
+    idx_t column_count;
 } duckdb_read_stat_bind_data;
 
 int duckdb_read_stat_ends_with(const char *string, const char *suffix);
@@ -39,14 +46,6 @@ int duckdb_read_stat_bind_handle_variable(int index, readstat_variable_t *variab
 
 void duckdb_read_stat_bind_handle_error(const char *error_message, void *ctx);
 
-typedef struct duckdb_read_stat_init_data
-{
-    idx_t offset;
-    idx_t actual_rows_read;
-} duckdb_read_stat_init_data;
-
-void duckdb_read_stat_init(duckdb_init_info info);
-
 typedef struct duckdb_read_stat_io_context
 {
     duckdb_file_handle file_handle;
@@ -55,9 +54,30 @@ typedef struct duckdb_read_stat_io_context
 typedef struct duckdb_read_stat_context
 {
     char *error_message;
-    duckdb_function_info function_info;
+    duckdb_read_stat_bind_data *bind_data;
     duckdb_data_chunk data_chunk;
+    duckdb_vector *vectors;
+    void **vector_data;
+    idx_t vector_capacity;
+    idx_t vector_count;
+    idx_t slot;
+    idx_t row_count;
+    int last_obs_index;
 } duckdb_read_stat_context;
+
+typedef struct duckdb_read_stat_init_data
+{
+    readstat_parser_t *parser;
+    readstat_reader_t *reader;
+    duckdb_read_stat_io_context *io_context;
+    duckdb_read_stat_context context;
+} duckdb_read_stat_init_data;
+
+void duckdb_read_stat_init(duckdb_init_info info);
+
+int duckdb_read_stat_handle_metadata(readstat_metadata_t *metadata, void *ctx);
+int duckdb_read_stat_handle_variable(int index, readstat_variable_t *variable,
+                                     const char *val_labels, void *ctx);
 
 int duckdb_read_stat_handle_value(int obs_index, readstat_variable_t *variable, readstat_value_t value, void *ctx);
 

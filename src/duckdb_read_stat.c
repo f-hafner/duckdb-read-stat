@@ -25,10 +25,73 @@ int duckdb_read_stat_ends_with(const char *string, const char *suffix)
     return lensuffix > lenstr ? false : strncasecmp(string + lenstr - lensuffix, suffix, lensuffix) == 0;
 }
 
+static duckdb_read_stat_datetime_format duckdb_read_stat_classify_datetime_format(const char *format)
+{
+    if (format == NULL)
+        return DATE_FORMAT_NONE;
+
+    if (
+        // SAS
+        !strcmp(format, "WEEKDATE") || !strcmp(format, "MMDDYY") || !strcmp(format, "DDMMYY") || !strcmp(format, "YYMMDD") || !strcmp(format, "DATE") || !strcmp(format, "DATE9") || !strcmp(format, "YYMMDD10") || !strcmp(format, "DDMMYYB") || !strcmp(format, "DDMMYYB10") || !strcmp(format, "DDMMYYC") || !strcmp(format, "DDMMYYC10") || !strcmp(format, "DDMMYYD") || !strcmp(format, "DDMMYYD10") || !strcmp(format, "DDMMYYN6") || !strcmp(format, "DDMMYYN8") || !strcmp(format, "DDMMYYP") || !strcmp(format, "DDMMYYP10") || !strcmp(format, "DDMMYYS") || !strcmp(format, "DDMMYYS10") || !strcmp(format, "MMDDYYB") || !strcmp(format, "MMDDYYB10") || !strcmp(format, "MMDDYYC") || !strcmp(format, "MMDDYYC10") || !strcmp(format, "MMDDYYD") || !strcmp(format, "MMDDYYD10") || !strcmp(format, "MMDDYYN6") || !strcmp(format, "MMDDYYN8") || !strcmp(format, "MMDDYYP") || !strcmp(format, "MMDDYYP10") || !strcmp(format, "MMDDYYS") || !strcmp(format, "MMDDYYS10") || !strcmp(format, "WEEKDATX") || !strcmp(format, "DTDATE") || !strcmp(format, "IS8601DA") || !strcmp(format, "E8601DA") || !strcmp(format, "B8601DA") || !strcmp(format, "YYMMDDB") || !strcmp(format, "YYMMDDD") || !strcmp(format, "YYMMDDN") || !strcmp(format, "YYMMDDP") || !strcmp(format, "YYMMDDS")
+        // SPSS without duplicates from SAS
+        || !strcmp(format, "DATE8") || !strcmp(format, "DATE11") || !strcmp(format, "DATE12") || !strcmp(format, "ADATE") || !strcmp(format, "ADATE8") || !strcmp(format, "ADATE10") || !strcmp(format, "EDATE") || !strcmp(format, "EDATE8") || !strcmp(format, "EDATE10") || !strcmp(format, "JDATE") || !strcmp(format, "JDATE5") || !strcmp(format, "JDATE7") || !strcmp(format, "SDATE") || !strcmp(format, "SDATE8") || !strcmp(format, "SDATE10")
+        // Stata
+        || !strcmp(format, "%td") || !strcmp(format, "%d") || !strcmp(format, "%tdD_m_Y") || !strcmp(format, "%tdCCYY-NN-DD"))
+    {
+        return DATE_FORMAT_DATE;
+    }
+
+    if (
+        // SAS
+        !strcmp(format, "DATETIME") || !strcmp(format, "DATETIME18") || !strcmp(format, "DATETIME19") || !strcmp(format, "DATETIME20") || !strcmp(format, "DATETIME21") || !strcmp(format, "DATETIME22") || !strcmp(format, "E8601DT") || !strcmp(format, "DATEAMPM") || !strcmp(format, "MDYAMPM") || !strcmp(format, "IS8601DT") || !strcmp(format, "B8601DT") || !strcmp(format, "B8601DN")
+        // SPSS without duplicates from SAS
+        || !strcmp(format, "DATETIME8") || !strcmp(format, "DATETIME17") || !strcmp(format, "DATETIME23.2") || !strcmp(format, "YMDHMS16") || !strcmp(format, "YMDHMS19") || !strcmp(format, "YMDHMS19.2") || !strcmp(format, "YMDHMS20")
+        // Stata
+        || !strcmp(format, "%tC") || !strcmp(format, "%tc"))
+    {
+        return DATE_FORMAT_DATETIME;
+    }
+
+    if (
+        // SAS
+        !strcmp(format, "TIME") || !strcmp(format, "HHMM") || !strcmp(format, "TIME20.3") || !strcmp(format, "TIME20") || !strcmp(format, "TIME5") || !strcmp(format, "TOD") || !strcmp(format, "TIMEAMPM") || !strcmp(format, "IS8601TM") || !strcmp(format, "E8601TM") || !strcmp(format, "B8601TM")
+        // SPSS without duplicates from SAS
+        || !strcmp(format, "DTIME") || !strcmp(format, "TIME8") || !strcmp(format, "TIME5") || !strcmp(format, "TIME11.2")
+        // Stata
+        || !strcmp(format, "%tcHH:MM:SS") || !strcmp(format, "%tcHH:MM"))
+    {
+        return DATE_FORMAT_TIME;
+    }
+
+    return DATE_FORMAT_NONE;
+}
+
 int duckdb_read_stat_bind_handle_metadata(readstat_metadata_t *metadata, void *ctx)
 {
     duckdb_read_stat_bind_data *context = (duckdb_read_stat_bind_data *)ctx;
+    int var_count = readstat_get_var_count(metadata);
+
     context->cardinality = readstat_get_row_count(metadata);
+
+    if (var_count > 0)
+    {
+        context->column_date_formats = duckdb_malloc(sizeof(duckdb_read_stat_datetime_format) * var_count);
+        context->column_has_defined_missing = duckdb_malloc(sizeof(uint8_t) * var_count);
+        if (context->column_date_formats != NULL && context->column_has_defined_missing != NULL)
+        {
+            memset(context->column_date_formats, 0, sizeof(duckdb_read_stat_datetime_format) * var_count);
+            memset(context->column_has_defined_missing, 0, sizeof(uint8_t) * var_count);
+            context->column_count = (idx_t)var_count;
+        }
+        else
+        {
+            duckdb_free(context->column_date_formats);
+            duckdb_free(context->column_has_defined_missing);
+            context->column_date_formats = NULL;
+            context->column_has_defined_missing = NULL;
+        }
+    }
+
     return READSTAT_HANDLER_OK;
 }
 
@@ -38,6 +101,8 @@ int duckdb_read_stat_bind_handle_variable(int index, readstat_variable_t *variab
     duckdb_read_stat_bind_data *context = (duckdb_read_stat_bind_data *)ctx;
     const char *name = readstat_variable_get_name(variable);
     readstat_type_t type = readstat_variable_get_type(variable);
+
+    (void)index;
     const char *format = readstat_variable_get_format(variable);
     duckdb_logical_type logical_type = NULL;
 
@@ -104,6 +169,14 @@ int duckdb_read_stat_bind_handle_variable(int index, readstat_variable_t *variab
         break;
     }
 
+    {
+        int var_index = readstat_variable_get_index(variable);
+        if (context->column_date_formats != NULL && var_index >= 0 && (idx_t)var_index < context->column_count)
+            context->column_date_formats[var_index] = duckdb_read_stat_classify_datetime_format(format);
+        if (context->column_has_defined_missing != NULL && var_index >= 0 && (idx_t)var_index < context->column_count)
+            context->column_has_defined_missing[var_index] = readstat_variable_get_missing_ranges_count(variable) > 0;
+    }
+
     duckdb_bind_add_result_column(context->bind_info, name, logical_type);
     duckdb_destroy_logical_type(&logical_type);
 
@@ -117,130 +190,277 @@ void duckdb_read_stat_bind_handle_error(const char *error_message, void *ctx)
     strcpy(context->error_message, error_message);
 }
 
+static void duckdb_read_stat_bind_data_free(void *ptr)
+{
+    duckdb_read_stat_bind_data *data = (duckdb_read_stat_bind_data *)ptr;
+
+    if (data == NULL)
+        return;
+
+    if (data->file_handle != NULL)
+    {
+        duckdb_file_handle_close(data->file_handle);
+        duckdb_destroy_file_handle(&data->file_handle);
+    }
+
+    duckdb_free(data->column_date_formats);
+    duckdb_free(data->column_has_defined_missing);
+    duckdb_free(data->error_message);
+    duckdb_free((void *)data->path);
+    duckdb_free((void *)data->format);
+    duckdb_free((void *)data->encoding);
+    duckdb_free(data);
+}
+
+static bool duckdb_read_stat_set_format(duckdb_read_stat_bind_data *data)
+{
+    const char *format = data->format;
+    const char *path = data->path;
+
+    if (format != NULL)
+    {
+        if (!strcmp(format, "sas7bdat"))
+        {
+            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+            data->readstat_format = READSTAT_FILE_FORMAT_SAS7BDAT;
+        }
+        else if (!strcmp(format, "xpt"))
+        {
+            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+            data->readstat_format = READSTAT_FILE_FORMAT_XPORT;
+        }
+        else if (!strcmp(format, "sav") || !strcmp(format, "zsav"))
+        {
+            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+            data->readstat_format = READSTAT_FILE_FORMAT_SAV;
+        }
+        else if (!strcmp(format, "por"))
+        {
+            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+            data->readstat_format = READSTAT_FILE_FORMAT_POR;
+        }
+        else if (!strcmp(format, "dta"))
+        {
+            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
+            data->readstat_format = READSTAT_FILE_FORMAT_DTA;
+        }
+        else
+        {
+            return false;
+        }
+        return true;
+    }
+
+    if (duckdb_read_stat_ends_with(path, ".sas7bdat"))
+    {
+        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+        data->readstat_format = READSTAT_FILE_FORMAT_SAS7BDAT;
+    }
+    else if (duckdb_read_stat_ends_with(path, ".xpt"))
+    {
+        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
+        data->readstat_format = READSTAT_FILE_FORMAT_XPORT;
+    }
+    else if (duckdb_read_stat_ends_with(path, ".sav") || duckdb_read_stat_ends_with(path, ".zsav"))
+    {
+        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+        data->readstat_format = READSTAT_FILE_FORMAT_SAV;
+    }
+    else if (duckdb_read_stat_ends_with(path, ".por"))
+    {
+        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
+        data->readstat_format = READSTAT_FILE_FORMAT_POR;
+    }
+    else if (duckdb_read_stat_ends_with(path, ".dta"))
+    {
+        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
+        data->readstat_format = READSTAT_FILE_FORMAT_DTA;
+    }
+    else
+    {
+        return false;
+    }
+
+    return true;
+}
+
+static void duckdb_read_stat_init_data_free(void *ptr)
+{
+    duckdb_read_stat_init_data *data = (duckdb_read_stat_init_data *)ptr;
+
+    if (data == NULL)
+        return;
+
+    if (data->reader != NULL)
+        readstat_reader_close(data->reader);
+    if (data->parser != NULL)
+        readstat_parser_free(data->parser);
+
+    duckdb_free(data->io_context);
+    duckdb_free(data->context.vectors);
+    duckdb_free(data->context.vector_data);
+    duckdb_free(data->context.error_message);
+    duckdb_free(data);
+}
+
 void duckdb_read_stat_bind(duckdb_bind_info info)
 {
     readstat_parser_t *parser = readstat_parser_init();
     duckdb_value path_value = duckdb_bind_get_parameter(info, 0);
     duckdb_value format_value = duckdb_bind_get_named_parameter(info, "format");
     duckdb_value encoding_value = duckdb_bind_get_named_parameter(info, "encoding");
-    const char *path = duckdb_get_varchar(path_value);
     duckdb_read_stat_bind_data *data = duckdb_malloc(sizeof(duckdb_read_stat_bind_data));
-    readstat_error_t error;
+    duckdb_read_stat_io_context io_context;
+    duckdb_client_context client_context = NULL;
+    duckdb_file_system file_system;
+    duckdb_file_open_options file_open_options;
+    duckdb_file_handle file_handle = NULL;
+    readstat_reader_t *reader = NULL;
+    readstat_error_t error = READSTAT_OK;
+
+    if (data == NULL || parser == NULL)
+    {
+        duckdb_bind_set_error(info, "read_stat: out of memory");
+        if (parser != NULL)
+            readstat_parser_free(parser);
+        duckdb_free(data);
+        return;
+    }
 
     data->bind_info = info;
-    data->path = path;
-    data->format = NULL;
-    data->encoding = NULL;
+    data->path = duckdb_get_varchar(path_value);
+    data->format = format_value != NULL ? duckdb_get_varchar(format_value) : NULL;
+    data->encoding = encoding_value != NULL ? duckdb_get_varchar(encoding_value) : NULL;
+    data->cardinality = 0;
+    data->error_message = NULL;
+    data->file_handle = NULL;
 
-    duckdb_read_stat_io_context *io_context = duckdb_malloc(sizeof(duckdb_read_stat_io_context));
-    duckdb_client_context client_context = NULL;
+    duckdb_destroy_value(&path_value);
+    if (format_value != NULL)
+        duckdb_destroy_value(&format_value);
+    if (encoding_value != NULL)
+        duckdb_destroy_value(&encoding_value);
+
+    if (data->path == NULL || !duckdb_read_stat_set_format(data))
+    {
+        duckdb_bind_set_error(info, "read_stat: could not determine file format");
+        duckdb_read_stat_bind_data_free(data);
+        readstat_parser_free(parser);
+        return;
+    }
+
     duckdb_table_function_get_client_context(info, &client_context);
-    duckdb_file_system file_system = duckdb_client_context_get_file_system(client_context);
-    duckdb_file_open_options file_open_options = duckdb_create_file_open_options();
+    file_system = duckdb_client_context_get_file_system(client_context);
+    duckdb_destroy_client_context(&client_context);
+    file_open_options = duckdb_create_file_open_options();
     duckdb_file_open_options_set_flag(file_open_options, DUCKDB_FILE_FLAG_READ, true);
-    duckdb_file_handle file_handle = NULL;
-    duckdb_state open_state = duckdb_file_system_open(file_system, path, file_open_options, &file_handle);
-    io_context->file_handle = file_handle;
+    if (duckdb_file_system_open(file_system, data->path, file_open_options, &file_handle) != DuckDBSuccess)
+        file_handle = NULL;
     duckdb_destroy_file_open_options(&file_open_options);
     duckdb_destroy_file_system(&file_system);
+
+    if (file_handle == NULL)
+    {
+        duckdb_bind_set_error(info, "read_stat: could not open file");
+        duckdb_read_stat_bind_data_free(data);
+        readstat_parser_free(parser);
+        return;
+    }
+
+    io_context.file_handle = file_handle;
 
     readstat_set_metadata_handler(parser, &duckdb_read_stat_bind_handle_metadata);
     readstat_set_variable_handler(parser, &duckdb_read_stat_bind_handle_variable);
     readstat_set_error_handler(parser, &duckdb_read_stat_bind_handle_error);
-    readstat_set_io_ctx(parser, io_context);
+    readstat_set_io_ctx(parser, &io_context);
     readstat_set_open_handler(parser, &duckdb_read_stat_handle_open);
     readstat_set_close_handler(parser, &duckdb_read_stat_handle_close);
     readstat_set_read_handler(parser, &duckdb_read_stat_handle_read);
     readstat_set_seek_handler(parser, &duckdb_read_stat_handle_seek);
     readstat_set_row_limit(parser, 0);
 
-    if (encoding_value != NULL)
-    {
-        const char *encoding = duckdb_get_varchar(encoding_value);
-        data->encoding = encoding;
-        readstat_set_file_character_encoding(parser, encoding);
-    }
+    if (data->encoding != NULL)
+        readstat_set_file_character_encoding(parser, data->encoding);
 
-    if (format_value != NULL)
-    {
-        const char *format = duckdb_get_varchar(format_value);
-        data->format = format;
-
-        if (!strcmp(format, "sas7bdat"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-            error = readstat_parse_sas7bdat(parser, path, data);
-        }
-        if (!strcmp(format, "xpt"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-            error = readstat_parse_xport(parser, path, data);
-        }
-        else if (!strcmp(format, "sav") || !strcmp(format, "zsav"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-            error = readstat_parse_sav(parser, path, data);
-        }
-        else if (!strcmp(format, "por"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-            error = readstat_parse_por(parser, path, data);
-        }
-        else if (!strcmp(format, "dta"))
-        {
-            data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
-            error = readstat_parse_dta(parser, path, data);
-        }
-    }
-    else if (duckdb_read_stat_ends_with(path, ".sas7bdat"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-        error = readstat_parse_sas7bdat(parser, path, data);
-    }
-    else if (duckdb_read_stat_ends_with(path, ".xpt"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SAS;
-        error = readstat_parse_xport(parser, path, data);
-    }
-    else if (duckdb_read_stat_ends_with(path, ".sav") || duckdb_read_stat_ends_with(path, ".zsav"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-        error = readstat_parse_sav(parser, path, data);
-    }
-    else if (duckdb_read_stat_ends_with(path, ".por"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_SPSS;
-        error = readstat_parse_por(parser, path, data);
-    }
-    else if (duckdb_read_stat_ends_with(path, ".dta"))
-    {
-        data->file_format = DUCKDB_READ_STAT_FILE_FORMAT_STATA;
-        error = readstat_parse_dta(parser, path, data);
-    }
+    reader = readstat_reader_open(parser, data->readstat_format, data->path, data, &error);
+    if (reader != NULL)
+        readstat_reader_close(reader);
+    readstat_parser_free(parser);
 
     if (error != READSTAT_OK)
     {
-        duckdb_bind_set_error(info, data->error_message);
-        duckdb_file_handle_close(io_context->file_handle);
-        duckdb_destroy_file_handle(&(io_context->file_handle));
-        duckdb_free(io_context);
-        readstat_parser_free(parser);
+        duckdb_bind_set_error(info, data->error_message != NULL ? data->error_message : "read_stat: failed to read file metadata");
+        duckdb_read_stat_bind_data_free(data);
         return;
     }
 
-    data->file_handle = io_context->file_handle;
+    data->file_handle = file_handle;
     duckdb_bind_set_cardinality(data->bind_info, data->cardinality, true);
-    duckdb_bind_set_bind_data(info, data, duckdb_free);
-    duckdb_free(io_context);
-    readstat_parser_free(parser);
+    duckdb_bind_set_bind_data(info, data, duckdb_read_stat_bind_data_free);
 }
 
 void duckdb_read_stat_init(duckdb_init_info info)
 {
+    duckdb_read_stat_bind_data *bind_data = (duckdb_read_stat_bind_data *)duckdb_init_get_bind_data(info);
     duckdb_read_stat_init_data *data = duckdb_malloc(sizeof(duckdb_read_stat_init_data));
-    data->offset = 0;
-    data->actual_rows_read = 0;
-    duckdb_init_set_init_data(info, data, duckdb_free);
+    readstat_parser_t *parser = readstat_parser_init();
+    readstat_error_t error = READSTAT_OK;
+
+    if (data == NULL || parser == NULL)
+    {
+        duckdb_init_set_error(info, "read_stat: out of memory");
+        if (parser != NULL)
+            readstat_parser_free(parser);
+        duckdb_free(data);
+        return;
+    }
+
+    memset(data, 0, sizeof(*data));
+    data->io_context = duckdb_malloc(sizeof(duckdb_read_stat_io_context));
+    if (data->io_context == NULL)
+    {
+        duckdb_init_set_error(info, "read_stat: out of memory");
+        readstat_parser_free(parser);
+        duckdb_free(data);
+        return;
+    }
+
+    data->parser = parser;
+    data->io_context->file_handle = bind_data->file_handle;
+    data->context.bind_data = bind_data;
+    data->context.data_chunk = NULL;
+    data->context.slot = 0;
+    data->context.last_obs_index = -1;
+    data->context.error_message = NULL;
+
+    duckdb_file_handle_seek(bind_data->file_handle, 0);
+
+    readstat_set_metadata_handler(parser, &duckdb_read_stat_handle_metadata);
+    readstat_set_variable_handler(parser, &duckdb_read_stat_handle_variable);
+    readstat_set_value_handler(parser, &duckdb_read_stat_handle_value);
+    readstat_set_error_handler(parser, &duckdb_read_stat_handle_error);
+    readstat_set_io_ctx(parser, data->io_context);
+    readstat_set_open_handler(parser, &duckdb_read_stat_handle_open);
+    readstat_set_close_handler(parser, &duckdb_read_stat_handle_close);
+    readstat_set_read_handler(parser, &duckdb_read_stat_handle_read);
+    readstat_set_seek_handler(parser, &duckdb_read_stat_handle_seek);
+    readstat_set_row_limit(parser, 0);
+
+    if (bind_data->encoding != NULL)
+        readstat_set_file_character_encoding(parser, bind_data->encoding);
+
+    data->reader = readstat_reader_open(parser, bind_data->readstat_format, bind_data->path, &data->context, &error);
+    if (data->reader == NULL)
+    {
+        duckdb_init_set_error(info, data->context.error_message != NULL ? data->context.error_message : "read_stat: failed to open file reader");
+        readstat_parser_free(parser);
+        duckdb_free(data->io_context);
+        duckdb_free(data->context.error_message);
+        duckdb_free(data);
+        return;
+    }
+
+    duckdb_init_set_init_data(info, data, duckdb_read_stat_init_data_free);
 }
 
 const int days_between_unix_epoch_and_sas_epoch = -3653;
@@ -372,90 +592,91 @@ duckdb_time duckdb_read_stat_to_time(double tstamp, duckdb_read_stat_file_format
 int duckdb_read_stat_handle_value(int obs_index, readstat_variable_t *variable, readstat_value_t value, void *ctx)
 {
     duckdb_read_stat_context *context = (duckdb_read_stat_context *)ctx;
-    duckdb_read_stat_bind_data *bind_data = duckdb_function_get_bind_data(context->function_info);
-    duckdb_read_stat_init_data *init_data = duckdb_function_get_init_data(context->function_info);
+    duckdb_read_stat_bind_data *bind_data = context->bind_data;
     idx_t var_index = readstat_variable_get_index(variable);
     readstat_type_t type = readstat_value_type(value);
-    const char *format = readstat_variable_get_format(variable);
-    duckdb_vector vector = duckdb_data_chunk_get_vector(context->data_chunk, var_index);
+    idx_t row_index;
+    duckdb_vector vector;
+    void *vector_data;
+    int has_defined_missing = 1;
+    int is_missing;
 
-    if (!readstat_value_is_system_missing(value) && !readstat_value_is_tagged_missing(value) && !readstat_value_is_defined_missing(value, variable))
+    if (obs_index != context->last_obs_index)
+    {
+        if (context->last_obs_index >= 0)
+            context->slot++;
+        context->last_obs_index = obs_index;
+        context->row_count = context->slot + 1;
+    }
+    row_index = context->slot;
+
+    if (context->vectors != NULL && (idx_t)var_index < context->vector_count)
+    {
+        vector = context->vectors[var_index];
+        vector_data = context->vector_data[var_index];
+    }
+    else
+    {
+        vector = duckdb_data_chunk_get_vector(context->data_chunk, var_index);
+        vector_data = duckdb_vector_get_data(vector);
+    }
+
+    if (bind_data->column_has_defined_missing != NULL && (idx_t)var_index < bind_data->column_count)
+        has_defined_missing = bind_data->column_has_defined_missing[var_index];
+
+    is_missing = readstat_value_is_system_missing(value) || readstat_value_is_tagged_missing(value);
+    if (!is_missing && has_defined_missing)
+        is_missing = readstat_value_is_defined_missing(value, variable);
+
+    if (!is_missing)
     {
         switch (type)
         {
         case READSTAT_TYPE_STRING:
         case READSTAT_TYPE_STRING_REF:
-            duckdb_vector_assign_string_element(vector, obs_index, readstat_string_value(value));
+            duckdb_vector_assign_string_element(vector, row_index, readstat_string_value(value));
             break;
 
         case READSTAT_TYPE_INT8:
-            ((int8_t *)duckdb_vector_get_data(vector))[obs_index] = readstat_int8_value(value);
+            ((int8_t *)vector_data)[row_index] = readstat_int8_value(value);
             break;
 
         case READSTAT_TYPE_INT16:
-            ((int16_t *)duckdb_vector_get_data(vector))[obs_index] = readstat_int16_value(value);
+            ((int16_t *)vector_data)[row_index] = readstat_int16_value(value);
             break;
 
         case READSTAT_TYPE_INT32:
-            ((int32_t *)duckdb_vector_get_data(vector))[obs_index] = readstat_int32_value(value);
+            ((int32_t *)vector_data)[row_index] = readstat_int32_value(value);
             break;
 
         case READSTAT_TYPE_FLOAT:
-            ((float *)duckdb_vector_get_data(vector))[obs_index] = readstat_float_value(value);
+            ((float *)vector_data)[row_index] = readstat_float_value(value);
             break;
 
         case READSTAT_TYPE_DOUBLE:
         {
             double double_value = readstat_double_value(value);
+            duckdb_read_stat_datetime_format date_format;
 
-            if (format != NULL)
-            {
-                if (
-                    // SAS
-                    !strcmp(format, "WEEKDATE") || !strcmp(format, "MMDDYY") || !strcmp(format, "DDMMYY") || !strcmp(format, "YYMMDD") || !strcmp(format, "DATE") || !strcmp(format, "DATE9") || !strcmp(format, "YYMMDD10") || !strcmp(format, "DDMMYYB") || !strcmp(format, "DDMMYYB10") || !strcmp(format, "DDMMYYC") || !strcmp(format, "DDMMYYC10") || !strcmp(format, "DDMMYYD") || !strcmp(format, "DDMMYYD10") || !strcmp(format, "DDMMYYN6") || !strcmp(format, "DDMMYYN8") || !strcmp(format, "DDMMYYP") || !strcmp(format, "DDMMYYP10") || !strcmp(format, "DDMMYYS") || !strcmp(format, "DDMMYYS10") || !strcmp(format, "MMDDYYB") || !strcmp(format, "MMDDYYB10") || !strcmp(format, "MMDDYYC") || !strcmp(format, "MMDDYYC10") || !strcmp(format, "MMDDYYD") || !strcmp(format, "MMDDYYD10") || !strcmp(format, "MMDDYYN6") || !strcmp(format, "MMDDYYN8") || !strcmp(format, "MMDDYYP") || !strcmp(format, "MMDDYYP10") || !strcmp(format, "MMDDYYS") || !strcmp(format, "MMDDYYS10") || !strcmp(format, "WEEKDATX") || !strcmp(format, "DTDATE") || !strcmp(format, "IS8601DA") || !strcmp(format, "E8601DA") || !strcmp(format, "B8601DA") || !strcmp(format, "YYMMDDB") || !strcmp(format, "YYMMDDD") || !strcmp(format, "YYMMDDN") || !strcmp(format, "YYMMDDP") || !strcmp(format, "YYMMDDS")
-                    // SPSS without duplicates from SAS
-                    || !strcmp(format, "DATE8") || !strcmp(format, "DATE11") || !strcmp(format, "DATE12") || !strcmp(format, "ADATE") || !strcmp(format, "ADATE8") || !strcmp(format, "ADATE10") || !strcmp(format, "EDATE") || !strcmp(format, "EDATE8") || !strcmp(format, "EDATE10") || !strcmp(format, "JDATE") || !strcmp(format, "JDATE5") || !strcmp(format, "JDATE7") || !strcmp(format, "SDATE") || !strcmp(format, "SDATE8") || !strcmp(format, "SDATE10")
-                    // Stata
-                    || !strcmp(format, "%td") || !strcmp(format, "%d") || !strcmp(format, "%tdD_m_Y") || !strcmp(format, "%tdCCYY-NN-DD"))
-                {
-                    duckdb_date converted = duckdb_read_stat_to_date(double_value, bind_data->file_format);
-                    duckdb_date *output_value_timestamp = (duckdb_date *)duckdb_vector_get_data(vector);
-                    output_value_timestamp[obs_index] = converted;
-                }
-                else if (
-                    // SAS
-                    !strcmp(format, "DATETIME") || !strcmp(format, "DATETIME18") || !strcmp(format, "DATETIME19") || !strcmp(format, "DATETIME20") || !strcmp(format, "DATETIME21") || !strcmp(format, "DATETIME22") || !strcmp(format, "E8601DT") || !strcmp(format, "DATEAMPM") || !strcmp(format, "MDYAMPM") || !strcmp(format, "IS8601DT") || !strcmp(format, "B8601DT") || !strcmp(format, "B8601DN")
-                    // SPSS without duplicates from SAS
-                    || !strcmp(format, "DATETIME8") || !strcmp(format, "DATETIME17") || !strcmp(format, "DATETIME23.2") || !strcmp(format, "YMDHMS16") || !strcmp(format, "YMDHMS19") || !strcmp(format, "YMDHMS19.2") || !strcmp(format, "YMDHMS20")
-                    // Stata
-                    || !strcmp(format, "%tC") || !strcmp(format, "%tc"))
-                {
-                    duckdb_timestamp converted = duckdb_read_stat_to_timestamp(double_value, bind_data->file_format);
-                    duckdb_timestamp *output_value_timestamp = (duckdb_timestamp *)duckdb_vector_get_data(vector);
-                    output_value_timestamp[obs_index] = converted;
-                }
-                else if (
-                    // SAS
-                    !strcmp(format, "TIME") || !strcmp(format, "HHMM") || !strcmp(format, "TIME20.3") || !strcmp(format, "TIME20") || !strcmp(format, "TIME5") || !strcmp(format, "TOD") || !strcmp(format, "TIMEAMPM") || !strcmp(format, "IS8601TM") || !strcmp(format, "E8601TM") || !strcmp(format, "B8601TM")
-                    // SPSS without duplicates from SAS
-                    || !strcmp(format, "DTIME") || !strcmp(format, "TIME8") || !strcmp(format, "TIME5") || !strcmp(format, "TIME11.2")
-                    // Stata
-                    || !strcmp(format, "%tcHH:MM:SS") || !strcmp(format, "%tcHH:MM"))
-                {
-                    duckdb_time converted = duckdb_read_stat_to_time(double_value, bind_data->file_format);
-                    duckdb_time *output_value_timestamp = (duckdb_time *)duckdb_vector_get_data(vector);
-                    output_value_timestamp[obs_index] = converted;
-                }
-                else
-                {
-                    double *output_value = (double *)duckdb_vector_get_data(vector);
-                    output_value[obs_index] = double_value;
-                }
-            }
+            if (bind_data->column_date_formats != NULL && (idx_t)var_index < bind_data->column_count)
+                date_format = bind_data->column_date_formats[var_index];
             else
+                date_format = duckdb_read_stat_classify_datetime_format(readstat_variable_get_format(variable));
+
+            switch (date_format)
             {
-                double *output_value = (double *)duckdb_vector_get_data(vector);
-                output_value[obs_index] = double_value;
+            case DATE_FORMAT_DATE:
+                ((duckdb_date *)vector_data)[row_index] = duckdb_read_stat_to_date(double_value, bind_data->file_format);
+                break;
+            case DATE_FORMAT_DATETIME:
+                ((duckdb_timestamp *)vector_data)[row_index] = duckdb_read_stat_to_timestamp(double_value, bind_data->file_format);
+                break;
+            case DATE_FORMAT_TIME:
+                ((duckdb_time *)vector_data)[row_index] = duckdb_read_stat_to_time(double_value, bind_data->file_format);
+                break;
+            default:
+                ((double *)vector_data)[row_index] = double_value;
+                break;
             }
             break;
         }
@@ -465,10 +686,8 @@ int duckdb_read_stat_handle_value(int obs_index, readstat_variable_t *variable, 
     {
         duckdb_vector_ensure_validity_writable(vector);
         uint64_t *validity = duckdb_vector_get_validity(vector);
-        duckdb_validity_set_row_invalid(validity, obs_index);
+        duckdb_validity_set_row_invalid(validity, row_index);
     }
-
-    init_data->actual_rows_read = obs_index + 1;
 
     return READSTAT_HANDLER_OK;
 }
@@ -492,8 +711,16 @@ int duckdb_read_stat_handle_value_label(const char *val_labels, readstat_value_t
 void duckdb_read_stat_handle_error(const char *error_message, void *ctx)
 {
     duckdb_read_stat_context *context = (duckdb_read_stat_context *)ctx;
+
+    duckdb_free(context->error_message);
+    context->error_message = NULL;
+
+    if (error_message == NULL)
+        return;
+
     context->error_message = (char *)duckdb_malloc(strlen(error_message) + 1);
-    strcpy(context->error_message, error_message);
+    if (context->error_message != NULL)
+        strcpy(context->error_message, error_message);
 }
 
 int duckdb_read_stat_handle_open(const char *path, void *io_ctx)
@@ -509,128 +736,113 @@ int duckdb_read_stat_handle_close(void *io_ctx)
 ssize_t duckdb_read_stat_handle_read(void *buf, size_t nbyte, void *io_ctx)
 {
     duckdb_file_handle file_handle = ((duckdb_read_stat_io_context *)io_ctx)->file_handle;
-    return duckdb_file_handle_read(file_handle, buf, nbyte);
+    int64_t bytes_read = duckdb_file_handle_read(file_handle, buf, (int64_t)nbyte);
+    return bytes_read < 0 ? -1 : (ssize_t)bytes_read;
 }
 
 readstat_off_t duckdb_read_stat_handle_seek(readstat_off_t offset, readstat_io_flags_t whence, void *io_ctx)
 {
     duckdb_file_handle file_handle = ((duckdb_read_stat_io_context *)io_ctx)->file_handle;
+    readstat_off_t position;
 
     switch (whence)
     {
     case READSTAT_SEEK_CUR:
-        return duckdb_file_handle_tell(file_handle) + duckdb_file_handle_seek(file_handle, duckdb_file_handle_tell(file_handle) + offset);
+        position = duckdb_file_handle_tell(file_handle) + offset;
+        break;
     case READSTAT_SEEK_SET:
-        return duckdb_file_handle_seek(file_handle, offset);
+        position = offset;
+        break;
     case READSTAT_SEEK_END:
-        return duckdb_file_handle_seek(file_handle, duckdb_file_handle_size(file_handle) - offset);
+        position = duckdb_file_handle_size(file_handle) + offset;
+        break;
+    default:
+        return -1;
     }
+
+    if (position < 0)
+        return -1;
+    if (duckdb_file_handle_seek(file_handle, position) != DuckDBSuccess)
+        return -1;
+    return position;
+}
+
+static int duckdb_read_stat_prepare_output(duckdb_read_stat_context *context, duckdb_data_chunk output)
+{
+    idx_t column_count = duckdb_data_chunk_get_column_count(output);
+
+    if (column_count > context->vector_capacity)
+    {
+        duckdb_vector *vectors = duckdb_malloc(sizeof(duckdb_vector) * column_count);
+        void **vector_data = duckdb_malloc(sizeof(void *) * column_count);
+
+        if (vectors == NULL || vector_data == NULL)
+        {
+            duckdb_free(vectors);
+            duckdb_free(vector_data);
+            return false;
+        }
+
+        duckdb_free(context->vectors);
+        duckdb_free(context->vector_data);
+        context->vectors = vectors;
+        context->vector_data = vector_data;
+        context->vector_capacity = column_count;
+    }
+
+    context->data_chunk = output;
+    context->vector_count = column_count;
+
+    for (idx_t i = 0; i < column_count; i++)
+    {
+        duckdb_vector vector = duckdb_data_chunk_get_vector(output, i);
+        context->vectors[i] = vector;
+        context->vector_data[i] = duckdb_vector_get_data(vector);
+    }
+
+    return true;
 }
 
 void duckdb_read_stat_function(duckdb_function_info info, duckdb_data_chunk output)
 {
     duckdb_read_stat_init_data *init_data = (duckdb_read_stat_init_data *)duckdb_function_get_init_data(info);
-    duckdb_read_stat_bind_data *bind_data = (duckdb_read_stat_bind_data *)duckdb_function_get_bind_data(info);
+    duckdb_read_stat_context *context = &init_data->context;
+    readstat_error_t error;
 
-    if (init_data->offset >= bind_data->cardinality)
+    if (context->error_message != NULL)
+    {
+        duckdb_function_set_error(info, context->error_message);
+        duckdb_data_chunk_set_size(output, 0);
+        return;
+    }
+
+    if (init_data->reader == NULL || readstat_reader_is_eof(init_data->reader))
     {
         duckdb_data_chunk_set_size(output, 0);
         return;
     }
 
-    readstat_error_t error = READSTAT_OK;
-    readstat_parser_t *parser = readstat_parser_init();
-
-    readstat_set_row_offset(parser, (long)init_data->offset);
-    readstat_set_row_limit(parser, (long)duckdb_vector_size());
-    readstat_set_metadata_handler(parser, &duckdb_read_stat_handle_metadata);
-    readstat_set_variable_handler(parser, &duckdb_read_stat_handle_variable);
-    readstat_set_value_handler(parser, &duckdb_read_stat_handle_value);
-    readstat_set_error_handler(parser, &duckdb_read_stat_handle_error);
-    duckdb_read_stat_io_context *io_context = duckdb_malloc(sizeof(duckdb_read_stat_io_context));
-    duckdb_file_handle_seek(bind_data->file_handle, 0);
-    io_context->file_handle = bind_data->file_handle;
-    readstat_set_io_ctx(parser, (void *)io_context);
-    readstat_set_open_handler(parser, &duckdb_read_stat_handle_open);
-    readstat_set_close_handler(parser, &duckdb_read_stat_handle_close);
-    readstat_set_read_handler(parser, &duckdb_read_stat_handle_read);
-    readstat_set_seek_handler(parser, &duckdb_read_stat_handle_seek);
-
-    duckdb_read_stat_context *context = duckdb_malloc(sizeof(duckdb_read_stat_context));
-    context->function_info = info;
-    context->data_chunk = output;
-    context->error_message = NULL;
-
-    if (bind_data->encoding != NULL)
+    if (!duckdb_read_stat_prepare_output(context, output))
     {
-        readstat_set_file_character_encoding(parser, bind_data->encoding);
-    }
-
-    if (bind_data->format != NULL)
-    {
-        if (!strcasecmp(bind_data->format, "sas7bdat"))
-        {
-            error = readstat_parse_sas7bdat(parser, bind_data->path, context);
-        }
-        else if (!strcasecmp(bind_data->format, "xpt"))
-        {
-            error = readstat_parse_xport(parser, bind_data->path, context);
-        }
-        else if (!strcasecmp(bind_data->format, "sav") || !strcasecmp(bind_data->format, "zsav"))
-        {
-            error = readstat_parse_sav(parser, bind_data->path, context);
-        }
-        else if (!strcasecmp(bind_data->format, "por"))
-        {
-            error = readstat_parse_por(parser, bind_data->path, context);
-        }
-        else if (!strcasecmp(bind_data->format, "dta"))
-        {
-            error = readstat_parse_dta(parser, bind_data->path, context);
-        }
-    }
-    else if (duckdb_read_stat_ends_with(bind_data->path, ".sas7bdat"))
-    {
-        error = readstat_parse_sas7bdat(parser, bind_data->path, context);
-    }
-    else if (duckdb_read_stat_ends_with(bind_data->path, ".xpt"))
-    {
-        error = readstat_parse_xport(parser, bind_data->path, context);
-    }
-    else if (duckdb_read_stat_ends_with(bind_data->path, ".sav") || duckdb_read_stat_ends_with(bind_data->path, ".zsav"))
-    {
-        error = readstat_parse_sav(parser, bind_data->path, context);
-    }
-    else if (duckdb_read_stat_ends_with(bind_data->path, ".por"))
-    {
-        error = readstat_parse_por(parser, bind_data->path, context);
-    }
-    else if (duckdb_read_stat_ends_with(bind_data->path, ".dta"))
-    {
-        error = readstat_parse_dta(parser, bind_data->path, context);
-    }
-
-    if (error != READSTAT_OK)
-    {
-        if (context->error_message != NULL)
-        {
-            duckdb_function_set_error(info, context->error_message);
-            duckdb_free(context->error_message);
-        }
-        duckdb_file_handle_close(io_context->file_handle);
-        duckdb_destroy_file_handle(&(io_context->file_handle));
-        duckdb_free(io_context);
-        duckdb_free(context);
-        readstat_parser_free(parser);
+        duckdb_function_set_error(info, "read_stat: out of memory");
+        duckdb_data_chunk_set_size(output, 0);
         return;
     }
 
-    readstat_parser_free(parser);
+    context->data_chunk = output;
+    context->slot = 0;
+    context->row_count = 0;
+    context->last_obs_index = -1;
 
-    init_data->offset += init_data->actual_rows_read;
-    duckdb_data_chunk_set_size(output, init_data->actual_rows_read);
-    init_data->actual_rows_read = 0;
-    duckdb_free(context);
+    error = readstat_reader_read_rows(init_data->reader, duckdb_vector_size());
+    if (error != READSTAT_OK)
+    {
+        duckdb_function_set_error(info, context->error_message != NULL ? context->error_message : readstat_error_message(error));
+        duckdb_data_chunk_set_size(output, 0);
+        return;
+    }
+
+    duckdb_data_chunk_set_size(output, context->row_count);
 }
 
 void duckdb_read_stat_register_read_stat_function(duckdb_connection connection)
